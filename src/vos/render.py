@@ -17,6 +17,7 @@ from vos.contracts import (
     NoteView,
     SourceRef,
     ThoughtView,
+    VideoNote,
     VideoResult,
 )
 
@@ -192,6 +193,45 @@ def _hhmmss(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# How many claims a video reply shows. Deliberately below what is stored: the rest are
+# one `/more` away, which is a graph read rather than another distillation.
+SHOWN_NOTES = 8
+
+def _by_section[N: (VideoNote, NoteView)](
+    notes: list[N],
+) -> list[tuple[str | None, list[N]]]:
+    """Group notes under their section heading, chronology preserved.
+
+    Sections are ordered by their earliest note and notes within one stay in time order,
+    so the reply reads forwards through the video while still being organised. Notes with
+    no section — an older artifact, or a model that skipped the field — collect into a
+    single unheaded group rather than producing a blank heading.
+
+    Works on both the freshly distilled `VideoNote` and the `NoteView` read back out of
+    the graph, so the video reply and `/more` cannot drift apart in layout.
+    """
+    groups: dict[str | None, list[N]] = {}
+    for note in sorted(notes, key=lambda n: n.t_seconds):
+        groups.setdefault(note.section or None, []).append(note)
+    return sorted(groups.items(), key=lambda kv: kv[1][0].t_seconds)
+
+
+def _note_lines[N: (VideoNote, NoteView)](notes: list[N], video_id: str) -> list[str]:
+    """Section headings and timestamp-led claim lines, shared by both renderers."""
+    lines: list[str] = []
+    for heading, group in _by_section(notes):
+        if heading:
+            lines.append(f"\n<b>{escape(heading)}</b>")
+        for note in group:
+            link = f"https://youtu.be/{video_id}?t={note.t_seconds}"
+            # Timestamp first: the times line up as a scannable column instead of
+            # trailing off the end of a claim that wraps onto a second line.
+            lines.append(
+                f"\n<a href=\"{link}\">[{_hhmmss(note.t_seconds)}]</a> {escape(note.text)}"
+            )
+    return lines
+
+
 def render_video(result: VideoResult) -> str:
     """The distillation message.
 
@@ -217,11 +257,17 @@ def render_video(result: VideoResult) -> str:
         lines.append(f"\n{escape(d.summary)}")
 
     if d.notes:
-        lines.append("")
-        for note in d.notes:
-            link = f"https://youtu.be/{meta.video_id}?t={note.t_seconds}"
+        # Highest-scoring few, then displayed in video order — score decides *which*
+        # claims appear, never the order they are read in.
+        shown = sorted(d.notes, key=lambda n: (-n.score, n.t_seconds))[:SHOWN_NOTES]
+        lines.extend(_note_lines(shown, meta.video_id))
+        hidden = len(d.notes) - len(shown)
+        if hidden:
+            # Not a loss — everything is in the graph. Saying so is what stops the reply
+            # reading as "that was everything".
             lines.append(
-                f"• {escape(note.text)} <a href=\"{link}\">[{_hhmmss(note.t_seconds)}]</a>"
+                f"\n<i>Showing the top {len(shown)} of {len(d.notes)} claims — "
+                "/more for the rest.</i>"
             )
     else:
         lines.append("\n<i>Nothing substantial enough to note.</i>")
@@ -234,6 +280,21 @@ def render_video(result: VideoResult) -> str:
     if result.is_generated is True:
         lines.append("\n🎙 Auto-generated captions — names may be mis-heard.")
 
+    return "\n".join(lines)
+
+
+def render_all_notes(notes: list[NoteView]) -> str:
+    """Every stored claim for one video — the `/more` reply.
+
+    Same layout as the original distillation so the two read as one thing, minus the
+    summary and caveats, which were said once already.
+    """
+    if not notes:
+        return "No notes stored for that video yet."
+
+    first = notes[0]
+    lines = [f"📺 <b>{escape(first.video_title)}</b>", f"<i>All {len(notes)} claims</i>"]
+    lines.extend(_note_lines(notes, first.video_id))
     return "\n".join(lines)
 
 
@@ -272,6 +333,7 @@ Just type. Anything you send that isn't a command is captured.
 <b>Video</b>
 Send a YouTube link and I'll distil it automatically.
 /video &lt;url&gt; — process one now
+/more [url] — every claim from a video, not just the best few
 /notes &lt;term&gt; — search what videos taught you
 /redistil &lt;url&gt; — re-run from the cached transcript
 """

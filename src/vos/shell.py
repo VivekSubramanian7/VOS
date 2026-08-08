@@ -36,6 +36,7 @@ from vos.journal import JsonlJournal
 from vos.projection import classify_one, process_video, reproject_missing
 from vos.render import (
     HELP,
+    render_all_notes,
     render_capture,
     render_following,
     render_notes,
@@ -221,6 +222,30 @@ class VosBot:
             return
         await self._queue_video(message.answer, video_id, None)
 
+    async def cmd_more(self, message: Message, command: CommandObject) -> None:
+        """Every stored claim for a video, not just the ones the reply had room for.
+
+        Bare `/more` means the most recently distilled video, mirroring how `/undo`
+        assumes the last thought — the overwhelmingly common case is "the one I just
+        sent". Costs nothing: the notes are already in the graph, so this is a read,
+        not another distillation.
+        """
+        raw = (command.args or "").strip()
+        if raw:
+            video_id = extract_video_id(raw) or find_video_id(raw)
+            if video_id is None:
+                await message.answer("Usage: <code>/more</code> or <code>/more &lt;url&gt;</code>")
+                return
+        else:
+            recent = await self.graph.all_video_ids()
+            if not recent:
+                await message.answer("No videos processed yet.")
+                return
+            video_id = recent[0]
+
+        notes = await self.graph.notes_for_video(video_id)
+        await _send(message.answer, render_all_notes(notes))
+
     async def cmd_notes(self, message: Message, command: CommandObject) -> None:
         if not command.args:
             await message.answer("Usage: <code>/notes leverage</code>")
@@ -375,6 +400,7 @@ class VosBot:
         r.message.register(self.cmd_video, Command("video"))
         r.message.register(self.cmd_redistil, Command("redistil"))
         r.message.register(self.cmd_notes, Command("notes"))
+        r.message.register(self.cmd_more, Command("more"))
         r.message.register(self.on_voice, F.voice | F.audio | F.video_note)
         # Registered last: anything not matched above is a thought.
         r.message.register(self.capture, F.text)

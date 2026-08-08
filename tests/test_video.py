@@ -11,6 +11,7 @@ the cache silently stops working, nothing breaks today and `/redistil` fails in 
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -119,10 +120,64 @@ def test_long_transcript_splits_and_carries_timestamps():
 def test_chunks_overlap_so_boundary_claims_survive():
     """A claim spoken across a window boundary must appear in both windows."""
     chunks = chunk_transcript(_segments(200), target_chars=2_000, overlap_chars=400)
-    first_tail = chunks[0][1][-200:]
-    assert first_tail.split()[-1] in chunks[1][1]
+    # Compare speech, not markers: a marker is chunk-relative and legitimately differs.
+    first_tail = [w for w in chunks[0][1][-200:].split() if not w.startswith("[t=")]
+    assert first_tail[-1] in chunks[1][1]
     # Overlap means the second chunk starts before the first one ended.
     assert chunks[1][0] < int(_segments(200)[-1].start)
+
+
+# --- timestamp markers ------------------------------------------------------- #
+#
+# Without these every note in a chunk carries the same timestamp — a 93-second video
+# produced three notes all pointing at 0:00, which is what prompted this.
+
+
+def _markers(text: str) -> list[int]:
+    return [int(m) for m in re.findall(r"\[t=(\d+)\]", text)]
+
+
+def test_every_chunk_opens_with_a_marker():
+    chunks = chunk_transcript(_segments(400), target_chars=2_000, overlap_chars=200)
+    for start, text in chunks:
+        assert text.startswith(f"[t={start}]")
+
+
+def test_markers_appear_at_the_requested_interval():
+    # Segments are 5s apart, so a 30s interval means roughly every 6th segment.
+    _, text = chunk_transcript(_segments(20), marker_interval_s=30)[0]
+    assert _markers(text) == [0, 30, 60, 90]
+
+
+def test_marker_interval_is_tunable():
+    _, text = chunk_transcript(_segments(20), marker_interval_s=15)[0]
+    assert _markers(text) == [0, 15, 30, 45, 60, 75, 90]
+
+
+def test_markers_increase_and_match_a_real_segment_start():
+    _, text = chunk_transcript(_segments(40), marker_interval_s=30)[0]
+    marks = _markers(text)
+    assert marks == sorted(marks)
+    starts = {int(s.start) for s in _segments(40)}
+    assert all(m in starts for m in marks)
+
+
+def test_a_short_video_still_gets_several_distinct_anchors():
+    """The regression: one anchor means every note lands on the same second."""
+    # ~93 seconds, as in the video that surfaced this.
+    segments = [
+        TranscriptSegment(text="some spoken words here", start=float(i) * 2.4, duration=2.4)
+        for i in range(40)
+    ]
+    _, text = chunk_transcript(segments)[0]
+    assert len(set(_markers(text))) >= 3
+
+
+def test_marker_characters_count_toward_the_window_budget():
+    """Otherwise the window quietly outgrows the limit that keeps it inside a context."""
+    chunks = chunk_transcript(_segments(400), target_chars=2_000, overlap_chars=200)
+    # Some slack for the final segment that crosses the threshold, but not unbounded.
+    assert all(len(text) < 2_400 for _, text in chunks)
 
 
 # --- fetching and caching ----------------------------------------------------- #

@@ -173,6 +173,28 @@ class FakeGraph:
     async def search_notes(self, term: str, n: int = 10):
         return []
 
+    async def notes_for_video(self, video_id: str):
+        from uuid import uuid4
+
+        from vos.contracts import NoteView
+
+        return [
+            NoteView(
+                id=uuid4(),
+                text=n.text,
+                t_seconds=n.t_seconds,
+                section=n.section,
+                score=n.score,
+                video_id=video_id,
+                video_title="A Talk",
+                url=f"https://youtu.be/{video_id}",
+            )
+            for n in self.notes.get(video_id, [])
+        ]
+
+    async def all_video_ids(self):
+        return list(self.videos)
+
     async def unprocessed_video_thoughts(self):
         return []
 
@@ -557,6 +579,49 @@ def test_parse_follow(raw, kind, name, author):
     source = _parse_follow(raw)
     assert source is not None
     assert (source.kind, source.name, source.author) == (kind, name, author)
+
+
+# --- /more ------------------------------------------------------------------ #
+
+
+async def test_more_shows_every_stored_claim(tmp_path: Path):
+    """The reply shows the best few; nothing is lost, so /more is a read not a re-run."""
+    bot, jobs = _video_bot(tmp_path)
+    await jobs.start()
+    await bot.capture(FakeMessage("https://youtu.be/dQw4w9WgXcQ"))  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    message = FakeMessage()
+    await bot.cmd_more(message, FakeCommand())  # type: ignore[arg-type]
+    assert "cannot measure one way" in message.last
+
+
+async def test_more_defaults_to_the_most_recent_video(tmp_path: Path):
+    bot, jobs = _video_bot(tmp_path)
+    await jobs.start()
+    await bot.capture(FakeMessage("https://youtu.be/dQw4w9WgXcQ"))  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    bare, explicit = FakeMessage(), FakeMessage()
+    await bot.cmd_more(bare, FakeCommand())  # type: ignore[arg-type]
+    await bot.cmd_more(explicit, FakeCommand("https://youtu.be/dQw4w9WgXcQ"))  # type: ignore[arg-type]
+    assert bare.last == explicit.last
+
+
+async def test_more_with_nothing_processed_says_so(tmp_path: Path):
+    bot, jobs = _video_bot(tmp_path)
+    message = FakeMessage()
+    await bot.cmd_more(message, FakeCommand())  # type: ignore[arg-type]
+    assert "No videos processed yet" in message.last
+
+
+async def test_more_rejects_something_that_is_not_a_video(tmp_path: Path):
+    bot, jobs = _video_bot(tmp_path)
+    message = FakeMessage()
+    await bot.cmd_more(message, FakeCommand("what did it say about pricing"))  # type: ignore[arg-type]
+    assert "Usage" in message.last
 
 
 @pytest.mark.parametrize("raw", ["", "person", "wizard Gandalf", "   "])

@@ -77,6 +77,10 @@ def _to_note(row: dict[str, Any]) -> NoteView:
         video_id=row["video_id"],
         video_title=row.get("title") or row["video_id"],
         url=row.get("url") or "",
+        section=row.get("section"),
+        # Notes written before scoring existed have no value signal; 0.5 keeps them
+        # mid-pack rather than pretending they were judged.
+        score=float(row.get("score") if row.get("score") is not None else 0.5),
     )
 
 
@@ -506,6 +510,8 @@ class Neo4jGraph:
                 "id": str(note_id(video_id, n.t_seconds, n.text)),
                 "text": n.text,
                 "t_seconds": n.t_seconds,
+                "section": n.section,
+                "score": n.score,
             }
             for n in notes
         ]
@@ -514,7 +520,8 @@ class Neo4jGraph:
             MATCH (v:Video {id: $vid})
             UNWIND $notes AS note
             MERGE (n:Note {id: note.id})
-              SET n.text = note.text, n.t_seconds = note.t_seconds
+              SET n.text = note.text, n.t_seconds = note.t_seconds,
+                  n.section = note.section, n.score = note.score
             MERGE (n)-[:FROM]->(v)
             """,
             vid=video_id,
@@ -553,6 +560,7 @@ class Neo4jGraph:
             """
             MATCH (n:Note)-[:FROM]->(v:Video {id: $vid})
             RETURN n.id AS id, n.text AS text, n.t_seconds AS t,
+                   n.section AS section, n.score AS score,
                    v.id AS video_id, v.title AS title, v.url AS url
             ORDER BY n.t_seconds
             """,
@@ -566,6 +574,7 @@ class Neo4jGraph:
             CALL db.index.fulltext.queryNodes('note_text', $term) YIELD node AS note
             MATCH (note)-[:FROM]->(v:Video)
             RETURN note.id AS id, note.text AS text, note.t_seconds AS t,
+                   note.section AS section, note.score AS score,
                    v.id AS video_id, v.title AS title, v.url AS url
             LIMIT $n
             """,

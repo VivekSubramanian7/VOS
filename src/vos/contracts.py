@@ -299,6 +299,28 @@ class VideoNote(BaseModel):
         description="A single self-contained claim you could agree or disagree with",
     )
     t_seconds: int = Field(ge=0, description="Where in the video this was said")
+    section: str | None = Field(
+        default=None,
+        max_length=40,
+        description="A 2-4 word heading grouping related claims, reused across them",
+    )
+    score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How much this is worth remembering years from now. "
+            "0.9-1.0: a specific number, mechanism, or falsifiable claim. "
+            "0.5-0.7: useful but widely known. "
+            "0.0-0.3: generic advice, promotion, or filler."
+        ),
+    )
+    """Which claims survive the display cap.
+
+    Anchors are spelled out in the field description because that text is part of the
+    prompt: asked for an unqualified 0-1 score, a model rates almost everything highly,
+    and a ranking where everything is 0.9 is not a ranking.
+    """
     entities: list[ExtractedEntity] = Field(default_factory=list)
 
 
@@ -316,6 +338,8 @@ class NoteView(BaseModel):
     video_id: str
     video_title: str
     url: str
+    section: str | None = None
+    score: float = 0.5
 
     @property
     def deep_link(self) -> str:

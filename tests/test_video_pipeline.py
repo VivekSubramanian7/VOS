@@ -304,9 +304,40 @@ def test_dedupe_keeps_genuinely_different_claims():
     assert len(_dedupe(notes, limit=10)) == 2
 
 
-def test_dedupe_respects_the_limit():
+def test_dedupe_respects_the_storage_ceiling():
     notes = [VideoNote(text=f"claim number {i}", t_seconds=i) for i in range(20)]
     assert len(_dedupe(notes, limit=5)) == 5
+
+
+def test_the_ceiling_keeps_the_best_claims_not_the_earliest():
+    """The old behaviour truncated a timestamp-sorted list, so a long video lost
+    whatever the speaker built up to. Value decides what survives; time decides order."""
+    notes = [
+        VideoNote(text="opening filler", t_seconds=0, score=0.1),
+        VideoNote(text="more early filler", t_seconds=30, score=0.2),
+        VideoNote(text="the key insight of the talk", t_seconds=3000, score=0.95),
+    ]
+    kept = _dedupe(notes, limit=2)
+    assert [n.text for n in kept] == ["more early filler", "the key insight of the talk"]
+
+
+def test_dedupe_returns_notes_in_time_order():
+    """Score selects; it must never reorder the reading."""
+    notes = [
+        VideoNote(text="a late but excellent claim", t_seconds=900, score=0.9),
+        VideoNote(text="an early modest claim", t_seconds=10, score=0.4),
+    ]
+    assert [n.t_seconds for n in _dedupe(notes, limit=10)] == [10, 900]
+
+
+def test_dedupe_preserves_section_and_score():
+    notes = [
+        VideoNote(text="A claim about pricing", t_seconds=10, section="Pricing", score=0.8),
+        VideoNote(text="A claim about latency", t_seconds=20, section="Performance", score=0.6),
+    ]
+    kept = _dedupe(notes, limit=10)
+    assert [n.section for n in kept] == ["Pricing", "Performance"]
+    assert [n.score for n in kept] == [0.8, 0.6]
 
 
 # --- cassette -------------------------------------------------------------------- #

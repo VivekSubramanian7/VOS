@@ -474,6 +474,31 @@ async def test_a_later_success_clears_the_failure_marker(graph: Neo4jGraph):
     assert rows[0] == {"p": None, "e": None}
 
 
+async def test_note_score_and_section_survive_the_round_trip(graph: Neo4jGraph):
+    """`/more` ranks and groups from the graph, so both must be stored, not just shown."""
+    await graph.upsert_video(_meta())
+    await graph.replace_notes(
+        "dQw4w9WgXcQ",
+        [
+            VideoNote(text="a strong claim", t_seconds=10, section="Setup", score=0.9),
+            VideoNote(text="a weaker claim", t_seconds=20, section="Pricing", score=0.2),
+        ],
+    )
+    notes = await graph.notes_for_video("dQw4w9WgXcQ")
+    assert [(n.section, n.score) for n in notes] == [("Setup", 0.9), ("Pricing", 0.2)]
+
+
+async def test_notes_written_before_scoring_read_back_mid_pack(graph: Neo4jGraph):
+    """0.5 rather than 0.0 — unscored is unknown, not worthless."""
+    await graph.upsert_video(_meta())
+    await graph.replace_notes("dQw4w9WgXcQ", [_note("an older claim", 10)])
+    await graph._run("MATCH (n:Note) REMOVE n.score, n.section")
+
+    (note,) = await graph.notes_for_video("dQw4w9WgXcQ")
+    assert note.score == 0.5
+    assert note.section is None
+
+
 async def test_caption_provenance_is_stored_on_the_video(graph: Neo4jGraph):
     await graph.upsert_video(_meta(), is_generated=True)
     rows = await graph._run("MATCH (v:Video) RETURN v.captions_auto AS auto")

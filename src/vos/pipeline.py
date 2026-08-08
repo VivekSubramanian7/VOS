@@ -215,14 +215,21 @@ Rules:
 1. Only what the transcript actually says. Auto-generated captions garble names,
    numbers, and technical terms constantly. If something is unclear, leave it out.
    Omission is free; an invented claim silently poisons the knowledge base.
-2. `t_seconds` must be the timestamp where the claim is made, taken from the
-   TIMESTAMPS markers in the transcript. Never estimate one.
+2. `t_seconds` must come from the nearest `[t=<seconds>]` marker *preceding* the claim.
+   Copy that number exactly. Never estimate one, and never reuse the first marker for
+   every note — different claims are made at different points.
 3. Each note stands alone. It will be read years later with no surrounding context,
    so resolve pronouns and name the subject.
 4. Extract entities worth finding this note by later: people, organisations, products,
    places, tickers, technical topics.
 5. Prefer 3-8 strong notes over a dozen weak ones. A transcript with little substance
    should yield few notes, or none.
+6. Give each note a `section`: a 2-4 word heading grouping related claims. Reuse the
+   same wording for claims that belong together — most videos need only 2-4 sections.
+   The headings organise the reply, so "Pricing" beats "Some thoughts on pricing".
+7. Score each note honestly. Only the best few are shown; the rest are kept but hidden
+   behind a command. Spread your scores — if everything is 0.9, nothing is ranked, and
+   the strongest claim in the video loses its place to filler.
 """
 
 SUMMARY_PROMPT = """\
@@ -242,21 +249,35 @@ class VideoState(BaseModel):
     error: str | None = None
     permanent: bool = True
     truncated: bool = False
+    notes_dropped: int = 0
 
 
 def _with_timestamps(start: int, text: str) -> str:
-    return f"[TIMESTAMPS: this section begins at {start} seconds]\n\n{text}"
+    return (
+        f"[This section begins at {start} seconds. Position markers of the form "
+        f"[t=<seconds>] appear throughout the text below.]\n\n{text}"
+    )
 
 
 def _dedupe(notes: list[VideoNote], limit: int) -> list[VideoNote]:
     """Chunks overlap so a claim near a boundary is seen twice. Collapse on a
-    normalised prefix, keeping the earliest timestamp."""
+    normalised prefix, keeping the earliest timestamp.
+
+    `limit` is a **storage** ceiling, not the number shown — a sanity bound on a runaway
+    distillation, deliberately far above what any reply displays. What it keeps is the
+    highest-scoring claims, not the earliest: truncating a timestamp-sorted list silently
+    discarded whatever the speaker built to, which is often the part worth keeping.
+
+    Returned in timestamp order regardless, because that is how everything downstream
+    reads them.
+    """
     seen: dict[str, VideoNote] = {}
     for note in sorted(notes, key=lambda n: n.t_seconds):
         key = " ".join(note.text.lower().split())[:80]
         if key not in seen:
             seen[key] = note
-    return sorted(seen.values(), key=lambda n: n.t_seconds)[:limit]
+    best = sorted(seen.values(), key=lambda n: (-n.score, n.t_seconds))[:limit]
+    return sorted(best, key=lambda n: n.t_seconds)
 
 
 def build_video_pipeline(
@@ -266,7 +287,9 @@ def build_video_pipeline(
     model_name: str = "unknown",
     cassette: Cassette | None = None,
     max_chunks: int = 12,
-    max_notes: int = 12,
+    # A storage ceiling, not a display one: the reply shows the best few and /more reads
+    # the rest straight out of the graph, so keeping them costs a row, not a token.
+    max_notes: int = 60,
 ):
     """Compile `fetch → distil`.
 

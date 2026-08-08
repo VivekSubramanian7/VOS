@@ -242,8 +242,38 @@ class VideoFetcher:
             )
 
 
+def _marked_text(segments: list[TranscriptSegment], interval_s: int) -> str:
+    """Join segment text, interleaving `[t=<seconds>]` position markers.
+
+    Without these the model has nothing to cite: joining the text discards every
+    per-segment start, leaving only the chunk's own, so every note in a chunk ends up
+    stamped with the same second — 0:00 for a short video.
+
+    Raw integer seconds rather than `mm:ss` because the model copies the number straight
+    into `t_seconds`; asking it to convert `1:03 → 63` adds arithmetic it can get wrong
+    for no benefit.
+    """
+    parts: list[str] = []
+    next_marker = float("-inf")
+    for segment in segments:
+        if segment.start >= next_marker:
+            parts.append(f"[t={int(segment.start)}]")
+            next_marker = segment.start + interval_s
+        parts.append(segment.text)
+    return " ".join(parts)
+
+
+def _marked_size(segments: list[TranscriptSegment], interval_s: int) -> int:
+    """Character cost of `_marked_text`, markers included."""
+    return len(_marked_text(segments, interval_s))
+
+
 def chunk_transcript(
-    segments: list[TranscriptSegment], *, target_chars: int = 12_000, overlap_chars: int = 600
+    segments: list[TranscriptSegment],
+    *,
+    target_chars: int = 12_000,
+    overlap_chars: int = 600,
+    marker_interval_s: int = 30,
 ) -> list[tuple[int, str]]:
     """Split into (start_seconds, text) windows on segment boundaries.
 
@@ -252,6 +282,9 @@ def chunk_transcript(
     window fits comfortably in any modern context.
 
     The overlap exists so a claim spoken across a window boundary is not lost.
+
+    Each window carries `[t=…]` markers roughly every `marker_interval_s` seconds, which
+    is what lets a note point at the moment its claim was actually made.
     """
     if not segments:
         return []
@@ -259,12 +292,19 @@ def chunk_transcript(
     chunks: list[tuple[int, str]] = []
     current: list[TranscriptSegment] = []
     size = 0
+    next_marker = float("-inf")
 
     for segment in segments:
+        # Mirrors `_marked_text`: markers count toward the budget, or the window quietly
+        # outgrows the limit that exists to keep it inside a context.
+        if segment.start >= next_marker:
+            size += len(f"[t={int(segment.start)}]") + 1
+            next_marker = segment.start + marker_interval_s
         current.append(segment)
         size += len(segment.text) + 1
+
         if size >= target_chars:
-            chunks.append((int(current[0].start), " ".join(s.text for s in current)))
+            chunks.append((int(current[0].start), _marked_text(current, marker_interval_s)))
             # Carry the tail forward as overlap.
             kept: list[TranscriptSegment] = []
             kept_size = 0
@@ -273,8 +313,12 @@ def chunk_transcript(
                     break
                 kept.insert(0, s)
                 kept_size += len(s.text) + 1
-            current, size = kept, kept_size
+            current = kept
+            # The carried tail is re-marked from its own first segment, so the running
+            # size and the next marker both have to be recomputed against that list.
+            size = _marked_size(kept, marker_interval_s)
+            next_marker = kept[0].start + marker_interval_s if kept else float("-inf")
 
     if current:
-        chunks.append((int(current[0].start), " ".join(s.text for s in current)))
+        chunks.append((int(current[0].start), _marked_text(current, marker_interval_s)))
     return chunks
