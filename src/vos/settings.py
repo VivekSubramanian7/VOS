@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # Back this up.
     vos_artifact_dir: Path = Field(default=Path("./artifacts"), alias="VOS_ARTIFACT_DIR")
 
+    # --- X pulse (optional) ---------------------------------------------
+    # Absent key means /pulse is off; nothing else changes. Live Search bills
+    # $0.025 per source on top of tokens, so `max_sources` is the cost lever:
+    # 25 sources is roughly $0.63 per digest against the daily budget above.
+    xai_api_key: SecretStr | None = Field(default=None, alias="XAI_API_KEY")
+    vos_pulse_model: str = Field(default="grok-4.1-fast", alias="VOS_PULSE_MODEL")
+    vos_pulse_max_sources: int = Field(default=25, alias="VOS_PULSE_MAX_SOURCES")
+    vos_pulse_topic: str = Field(default="AI", alias="VOS_PULSE_TOPIC")
+    vos_xai_base_url: str = Field(default="https://api.x.ai/v1", alias="VOS_XAI_BASE_URL")
+
 
 _settings: Settings | None = None
 

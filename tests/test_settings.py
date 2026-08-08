@@ -92,3 +92,34 @@ def test_settings_constructible_without_an_env_file(tmp_path, monkeypatch):
         NEO4J_PASSWORD="p",
     )
     assert s.vos_model == "anthropic:claude-opus-5"
+
+
+def test_pulse_is_optional(monkeypatch):
+    """No xAI key must not stop the bot starting — every other feature is unaffected."""
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+    )
+    assert settings.xai_api_key is None
+
+
+def test_pulse_defaults():
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+    )
+    assert settings.vos_pulse_max_sources == 25
+    assert settings.vos_pulse_topic == "AI"
+
+
+def test_pulse_source_cap_is_configurable():
+    """The cap is the cost lever: 25 sources is ~$0.63 a digest at $0.025 each."""
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+        VOS_PULSE_MAX_SOURCES=8,
+    )
+    assert settings.vos_pulse_max_sources == 8
