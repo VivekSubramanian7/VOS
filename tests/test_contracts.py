@@ -16,8 +16,14 @@ from vos.contracts import (
     CaptureRecord,
     Classification,
     ExtractedEntity,
+    PostView,
+    PulseDigest,
+    PulsePost,
+    PulseResult,
     SourceRef,
     canonical,
+    post_id,
+    pulse_id,
     thought_id,
 )
 
@@ -93,3 +99,55 @@ def test_canonical_keeps_distinct_names_distinct():
 
 def test_source_ref_canonical_name():
     assert SourceRef(name="  Paul  Graham ", kind="person").canonical_name == "paul graham"
+
+
+def test_post_id_is_stable_for_the_same_url():
+    """The same post surfacing in two digests must stay one node in the graph."""
+    url = "https://x.com/karpathy/status/1234567890"
+    assert post_id(url) == post_id(url)
+
+
+def test_post_id_differs_between_posts():
+    assert post_id("https://x.com/a/status/1") != post_id("https://x.com/a/status/2")
+
+
+def test_pulse_id_is_stable_for_the_same_run():
+    at = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    assert pulse_id("AI", at) == pulse_id("AI", at)
+
+
+def test_pulse_id_differs_between_runs():
+    """Each run is its own digest even on the same topic."""
+    a = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    b = datetime(2026, 8, 9, 18, 0, tzinfo=UTC)
+    assert pulse_id("AI", a) != pulse_id("AI", b)
+
+
+def test_post_score_defaults_to_mid():
+    post = PulsePost(
+        text="a claim", author_handle="@karpathy", url="https://x.com/karpathy/status/1"
+    )
+    assert post.score == 0.5
+
+
+def test_post_view_deep_link_is_the_post_url():
+    view = PostView(
+        id=post_id("https://x.com/karpathy/status/1"),
+        text="a claim",
+        author_handle="@karpathy",
+        url="https://x.com/karpathy/status/1",
+        topic="AI",
+        asked_at=datetime(2026, 8, 9, tzinfo=UTC),
+    )
+    assert view.deep_link == "https://x.com/karpathy/status/1"
+
+
+def test_pulse_result_is_not_ok_without_a_digest():
+    assert not PulseResult(topic="AI", error="boom").ok
+
+
+def test_pulse_result_is_ok_with_a_digest():
+    digest = PulseDigest(
+        topic="AI", summary="s", posts=[], asked_at=datetime(2026, 8, 9, tzinfo=UTC)
+    )
+    assert PulseResult(topic="AI", digest=digest).ok
