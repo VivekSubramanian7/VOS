@@ -1,0 +1,516 @@
+"""Telegram gateway.
+
+aiogram 3, long-polling. No webhook, no public URL, no tunnel — which is why the dev
+machine and a VPS behave identically and the move between them needs no code change.
+
+The capture handler implements §8.1, and the ordering there is the contract:
+
+    journal.append()  ->  fsync  ->  ack  ->  classify  ->  update
+
+Nothing before the fsync may be skipped, and nothing after it may be allowed to fail
+the capture. If the journal write raises, the user is told the thought was NOT saved —
+a false "captured" is the one outcome the design refuses.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import Message, TelegramObject
+
+from vos.cassette import BudgetGuard, Cassette
+from vos.contracts import CaptureRecord, CaptureResult, SourceKind, SourceRef
+from vos.graph import Neo4jGraph
+from vos.jobs import JobQueue
+from vos.journal import JsonlJournal
+from vos.projection import classify_one, process_video, reproject_missing
+from vos.render import (
+    HELP,
+    render_capture,
+    render_following,
+    render_notes,
+    render_stats,
+    render_thoughts,
+    render_video,
+    split_message,
+)
+from vos.video import VideoFetcher, extract_video_id, find_video_id
+
+log = logging.getLogger(__name__)
+
+
+async def _send(answer: Callable[[str], Awaitable[Any]], text: str) -> None:
+    """Deliver rendered output, split if Telegram would reject it as too long.
+
+    Every list-shaped reply needs this, not just the video one: `/recent 50` alone
+    renders well past the 4096-character ceiling with no model involved.
+    """
+    for chunk in split_message(text):
+        await answer(chunk)
+
+
+async def _replace(
+    note: Any, answer: Callable[[str], Awaitable[Any]], text: str
+) -> None:
+    """Overwrite a placeholder message, continuing into follow-ups if it won't fit.
+
+    `edit_text` carries exactly one message, so the remainder has to be sent beside it.
+    """
+    first, *rest = split_message(text)
+    await note.edit_text(first)
+    for chunk in rest:
+        await answer(chunk)
+
+
+class VosBot:
+    """Wires the components together and exposes an aiogram Router.
+
+    Dependencies are injected rather than constructed here, so the whole shell can be
+    driven in tests with a fake journal/graph/pipeline and no Telegram at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: JsonlJournal,
+        graph: Neo4jGraph,
+        pipeline: Any,
+        cassette: Cassette | None = None,
+        budget: BudgetGuard | None = None,
+        video_pipeline: Any = None,
+        jobs: JobQueue | None = None,
+    ) -> None:
+        self.journal = journal
+        self.graph = graph
+        self.pipeline = pipeline
+        self.cassette = cassette
+        self.budget = budget
+        self.video_pipeline = video_pipeline
+        self.jobs = jobs
+
+    # -- capture -------------------------------------------------------- #
+
+    async def capture(self, message: Message) -> None:
+        text = (message.text or "").strip()
+        if not text:
+            return
+
+        record = CaptureRecord.create(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text=text,
+            captured_at=datetime.now(UTC),
+        )
+
+        # --- durability boundary --------------------------------------- #
+        try:
+            await self.journal.append(record)
+        except OSError as exc:
+            # Refusing to ack is correct. Pretending to have saved it is not.
+            log.exception("Journal write failed for %s", record.id)
+            await message.answer(
+                "❌ <b>Not saved.</b> I couldn't write to the journal "
+                f"(<i>{exc.__class__.__name__}</i>). Please send it again."
+            )
+            return
+
+        # From here on the thought is safe. Everything below is enrichment and is
+        # allowed to fail without losing anything.
+        with contextlib.suppress(Exception):
+            await self.graph.upsert_thought(record, None)
+
+        ack = await message.answer("📥 Captured…")
+        result = await self._enrich(record)
+        await _replace(ack, message.answer, render_capture(result))
+
+        # A video link gets queued rather than processed here: distillation takes
+        # 20-60s and the polling loop must not stall for it.
+        if (
+            result.classification is not None
+            and result.classification.category == "VideoKnowledge"
+            and (video_id := find_video_id(text)) is not None
+        ):
+            await self._queue_video(message.answer, video_id, record.id)
+
+    async def _enrich(self, record: CaptureRecord) -> CaptureResult:
+        if self.budget and self.budget.exceeded():
+            with contextlib.suppress(Exception):
+                await self.graph.mark_unclassified(record.id, "daily budget reached")
+            return CaptureResult(
+                record=record, status="unclassified", error="daily budget reached"
+            )
+
+        try:
+            classification, error, linked = await classify_one(
+                self.pipeline, self.graph, record
+            )
+        except Exception as exc:  # noqa: BLE001 - e.g. the graph is down
+            log.exception("Enrichment failed for %s", record.id)
+            return CaptureResult(
+                record=record, status="unclassified", error=f"{type(exc).__name__}: {exc}"
+            )
+
+        if classification is None:
+            return CaptureResult(record=record, status="unclassified", error=error)
+
+        return CaptureResult(
+            record=record,
+            classification=classification,
+            linked_sources=linked,
+            status="classified",
+        )
+
+    # -- video ---------------------------------------------------------- #
+
+    async def _queue_video(
+        self, answer: Callable[[str], Awaitable[Any]], video_id: str, thought_id: UUID | None
+    ) -> None:
+        """Enqueue distillation and post the result when it lands.
+
+        Takes an `answer` callable rather than a Message so startup recovery — which
+        has no incoming message to reply to — can pass `bot.send_message` instead.
+        """
+        if self.video_pipeline is None or self.jobs is None:
+            return
+
+        async def job() -> None:
+            note = await answer("📺 Reading the transcript…")
+            try:
+                result = await process_video(
+                    self.video_pipeline, self.graph, video_id, thought_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Video job failed for %s", video_id)
+                await note.edit_text(
+                    f"📺 Video processing failed: <i>{type(exc).__name__}</i>. "
+                    "The thought itself is saved."
+                )
+                return
+            await _replace(note, answer, render_video(result))
+
+        await self.jobs.submit(f"video:{video_id}", job)
+
+    async def cmd_video(self, message: Message, command: CommandObject) -> None:
+        video_id = extract_video_id(command.args or "") or find_video_id(command.args or "")
+        if video_id is None:
+            await message.answer(
+                "Give me a YouTube link: <code>/video https://youtu.be/…</code>\n"
+                "<i>Only YouTube is supported for now.</i>"
+            )
+            return
+        if self.jobs is None:
+            await message.answer("Video processing isn't enabled.")
+            return
+        await self._queue_video(message.answer, video_id, None)
+
+    async def cmd_redistil(self, message: Message, command: CommandObject) -> None:
+        """Re-run distillation from the cached transcript — the point of caching it."""
+        video_id = extract_video_id(command.args or "") or find_video_id(command.args or "")
+        if video_id is None:
+            await message.answer("Usage: <code>/redistil https://youtu.be/…</code>")
+            return
+        await self._queue_video(message.answer, video_id, None)
+
+    async def cmd_notes(self, message: Message, command: CommandObject) -> None:
+        if not command.args:
+            await message.answer("Usage: <code>/notes leverage</code>")
+            return
+        notes = await self.graph.search_notes(command.args.strip(), 15)
+        await _send(
+            message.answer, render_notes(notes, f"Notes matching “{command.args.strip()}”")
+        )
+
+    async def requeue_unprocessed_videos(
+        self, answer: Callable[[str], Awaitable[Any]]
+    ) -> int:
+        """Startup recovery for the non-durable queue.
+
+        Outstanding work is derived rather than stored: a VideoKnowledge thought with
+        no :Video attached hasn't been processed.
+        """
+        if self.video_pipeline is None or self.jobs is None:
+            return 0
+        by_id = {r.id: r for r in self.journal.records()}
+        queued = 0
+        for view in await self.graph.unprocessed_video_thoughts():
+            record = by_id.get(view.id)
+            if record is None or (video_id := find_video_id(record.text)) is None:
+                continue
+            await self._queue_video(answer, video_id, record.id)
+            queued += 1
+        return queued
+
+    # -- commands ------------------------------------------------------- #
+
+    async def cmd_start(self, message: Message) -> None:
+        await message.answer(HELP)
+
+    async def cmd_recent(self, message: Message, command: CommandObject) -> None:
+        n = _int_arg(command.args, default=10, maximum=50)
+        views = await self.graph.recent(n)
+        await _send(
+            message.answer,
+            render_thoughts(views, f"Last {len(views)}", "Nothing captured yet."),
+        )
+
+    async def cmd_category(self, message: Message, command: CommandObject) -> None:
+        if not command.args:
+            await message.answer("Usage: <code>/category TripPlanning</code>")
+            return
+        name = _match_category(command.args.strip())
+        if name is None:
+            await message.answer(f"Unknown category: <code>{command.args.strip()}</code>")
+            return
+        views = await self.graph.by_category(name, 20)
+        await _send(message.answer, render_thoughts(views, name, f"Nothing in {name} yet."))
+
+    async def cmd_search(self, message: Message, command: CommandObject) -> None:
+        if not command.args:
+            await message.answer("Usage: <code>/search oat milk</code>")
+            return
+        views = await self.graph.search(command.args.strip(), 20)
+        await _send(
+            message.answer,
+            render_thoughts(views, f"Matches for “{command.args.strip()}”", "No matches."),
+        )
+
+    async def cmd_undo(self, message: Message) -> None:
+        last = self.journal.last_capture()
+        if last is None:
+            await message.answer("Nothing to undo.")
+            return
+        from vos.contracts import Tombstone
+
+        # Tombstone first: the journal leads, the graph follows.
+        await self.journal.append(Tombstone(id=last.id, deleted_at=datetime.now(UTC)))
+        with contextlib.suppress(Exception):
+            await self.graph.soft_delete(last.id)
+        await message.answer(f"🗑 Removed: <i>{last.text[:80]}</i>")
+
+    async def cmd_stats(self, message: Message) -> None:
+        stats = await self.graph.stats()
+        spent = self.budget.spent_today() if self.budget else None
+        await _send(message.answer, render_stats(stats, spent))
+
+    async def cmd_pending(self, message: Message) -> None:
+        views = await self.graph.pending()
+        if not views:
+            await message.answer("✅ Nothing pending — everything is filed.")
+            return
+
+        note = await message.answer(f"Retrying {len(views)} thought(s)…")
+        by_id = {r.id: r for r in self.journal.records()}
+        ok = failed = 0
+        for view in views:
+            record = by_id.get(view.id)
+            if record is None:
+                continue
+            classification, _, _ = await classify_one(self.pipeline, self.graph, record)
+            ok += classification is not None
+            failed += classification is None
+        await note.edit_text(
+            f"✅ Filed {ok}." + (f" ⚠️ {failed} still failing." if failed else "")
+        )
+
+    async def cmd_follow(self, message: Message, command: CommandObject) -> None:
+        source = _parse_follow(command.args or "")
+        if source is None:
+            await message.answer(
+                "Usage:\n"
+                "<code>/follow person Naval Ravikant</code>\n"
+                "<code>/follow book Sapiens by Harari</code>\n"
+                "<code>/follow channel https://youtube.com/@veritasium</code>"
+            )
+            return
+        await self.graph.follow(source)
+        await message.answer(f"⭐ Following <b>{source.name}</b> ({source.kind})")
+
+    async def cmd_unfollow(self, message: Message, command: CommandObject) -> None:
+        if not command.args:
+            await message.answer("Usage: <code>/unfollow Naval Ravikant</code>")
+            return
+        removed = await self.graph.unfollow(command.args.strip())
+        await message.answer(
+            f"Unfollowed <b>{command.args.strip()}</b>."
+            if removed
+            else f"Not following <b>{command.args.strip()}</b>."
+        )
+
+    async def cmd_following(self, message: Message) -> None:
+        await _send(message.answer, render_following(await self.graph.following()))
+
+    async def on_voice(self, message: Message) -> None:
+        """Explicit, never a silent drop — a thought the user believes was captured
+        and wasn't is worse than a clear refusal."""
+        await message.answer(
+            "🎤 Voice isn't wired up yet — this note was <b>not</b> saved.\n"
+            "Send it as text for now."
+        )
+
+    # -- wiring --------------------------------------------------------- #
+
+    def router(self) -> Router:
+        r = Router()
+        r.message.register(self.cmd_start, CommandStart())
+        r.message.register(self.cmd_start, Command("help"))
+        r.message.register(self.cmd_recent, Command("recent"))
+        r.message.register(self.cmd_category, Command("category"))
+        r.message.register(self.cmd_search, Command("search"))
+        r.message.register(self.cmd_undo, Command("undo"))
+        r.message.register(self.cmd_stats, Command("stats"))
+        r.message.register(self.cmd_pending, Command("pending"))
+        r.message.register(self.cmd_follow, Command("follow"))
+        r.message.register(self.cmd_unfollow, Command("unfollow"))
+        r.message.register(self.cmd_following, Command("following"))
+        r.message.register(self.cmd_video, Command("video"))
+        r.message.register(self.cmd_redistil, Command("redistil"))
+        r.message.register(self.cmd_notes, Command("notes"))
+        r.message.register(self.on_voice, F.voice | F.audio | F.video_note)
+        # Registered last: anything not matched above is a thought.
+        r.message.register(self.capture, F.text)
+        return r
+
+
+# --- helpers ------------------------------------------------------------ #
+
+
+def _int_arg(raw: str | None, *, default: int, maximum: int) -> int:
+    try:
+        return max(1, min(int((raw or "").strip()), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _match_category(raw: str) -> str | None:
+    from vos.contracts import CATEGORIES
+
+    squashed = raw.replace(" ", "").replace("-", "").casefold()
+    for name in CATEGORIES:
+        if name.casefold() == squashed:
+            return name
+    return None
+
+
+def _parse_follow(args: str) -> SourceRef | None:
+    """`/follow book Sapiens by Harari` -> SourceRef(kind='book', author='Harari')."""
+    parts = args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    kind_raw, rest = parts[0].casefold(), parts[1].strip()
+    if kind_raw not in ("person", "book", "channel"):
+        return None
+    kind: SourceKind = kind_raw  # type: ignore[assignment]
+
+    author = None
+    if kind == "book" and " by " in rest:
+        rest, author = (p.strip() for p in rest.rsplit(" by ", 1))
+
+    url = rest if rest.startswith(("http://", "https://")) else None
+    return SourceRef(name=rest, kind=kind, url=url, author=author)
+
+
+class AllowOnlyOwner:
+    """Outer middleware dropping every update from anyone but the owner.
+
+    A bot token is effectively public — anyone who learns the username can message the
+    bot. Without this, a stranger could write into the graph and spend the model
+    budget. Dropped silently: a reply would confirm the bot exists.
+    """
+
+    def __init__(self, allowed_user_id: int) -> None:
+        self.allowed_user_id = allowed_user_id
+
+    async def __call__(self, handler, event: TelegramObject, data: dict) -> Any:
+        user = data.get("event_from_user")
+        if user is not None and user.id != self.allowed_user_id:
+            log.warning("Dropped update from unauthorised user %s", user.id)
+            return None
+        return await handler(event, data)
+
+
+# --- entrypoint ---------------------------------------------------------- #
+
+
+async def run() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+    )
+    from vos.pipeline import build_pipeline, build_video_pipeline, load_model
+    from vos.settings import get_settings
+
+    settings = get_settings()
+
+    journal = JsonlJournal(settings.vos_journal_dir)
+    cassette = Cassette(settings.vos_cassette_dir)
+    budget = BudgetGuard(cassette, settings.vos_daily_budget_usd)
+    fetcher = VideoFetcher(settings.vos_artifact_dir)
+    graph = Neo4jGraph.connect(
+        settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password.get_secret_value()
+    )
+
+    model = load_model(settings.vos_model)
+    pipeline = build_pipeline(model, model_name=settings.vos_model, cassette=cassette)
+    video_pipeline = build_video_pipeline(
+        model, fetcher, model_name=settings.vos_model, cassette=cassette
+    )
+
+    await graph.ensure_schema()
+    recovered = await reproject_missing(journal, graph)
+    if recovered:
+        log.info("Recovered %d thought(s) from the journal into the graph.", len(recovered))
+
+    jobs = JobQueue(concurrency=1)  # single writer — see ADR-008
+    await jobs.start()
+
+    bot = Bot(
+        token=settings.telegram_bot_token.get_secret_value(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    vos = VosBot(
+        journal=journal,
+        graph=graph,
+        pipeline=pipeline,
+        cassette=cassette,
+        budget=budget,
+        video_pipeline=video_pipeline,
+        jobs=jobs,
+    )
+
+    async def announce(text: str):
+        return await bot.send_message(settings.vos_allowed_user_id, text)
+
+    # The job queue is in-memory, so a restart loses whatever was waiting. Outstanding
+    # work is recovered from the graph rather than persisted (see vos.jobs).
+    if requeued := await vos.requeue_unprocessed_videos(announce):
+        log.info("Re-queued %d unprocessed video(s).", requeued)
+
+    dp = Dispatcher()
+    dp.update.outer_middleware(AllowOnlyOwner(settings.vos_allowed_user_id))
+    dp.include_router(vos.router())
+
+    log.info("VOS listening. Model=%s", settings.vos_model)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await jobs.stop()
+        await graph.close()
+        await bot.session.close()
+
+
+def main() -> None:
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(run())
+
+
+if __name__ == "__main__":
+    main()

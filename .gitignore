@@ -1,0 +1,32 @@
+# Secrets — never commit.
+# The glob matters: .env.bak, .env.local, .env.prod are just as sensitive as .env,
+# and a bare ".env" line does not cover them. .env.example is the one exception.
+.env
+.env.*
+!.env.example
+
+# Source of truth and derived data: local only
+journal/
+artifacts/
+cassettes/
+neo4j-data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS / tooling caches
+.vscode/
+.idea/
+.impeccable/
+.DS_Store
+Thumbs.db
