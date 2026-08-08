@@ -125,7 +125,6 @@ async def process_video(
         distillation=distillation,
         note_count=count,
         truncated=bool(out.get("truncated")),
-        notes_dropped=int(out.get("notes_dropped") or 0),
         is_generated=artifact.is_generated,
     )
 
