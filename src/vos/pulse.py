@@ -22,9 +22,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from vos.contracts import PulseDigest, PulsePost
+from vos.cassette import price
+from vos.contracts import PulseArtifact, PulseDigest, PulseError, PulsePost, pulse_id
 
 log = logging.getLogger(__name__)
 
@@ -192,3 +195,135 @@ def user_prompt(topic: str, handles: list[str]) -> str:
             f"yourself to them: {', '.join(handles)}."
         )
     return ask
+
+
+Transport = Callable[[dict], Awaitable[dict]]
+
+
+class PulseFetcher:
+    """One digest per call, cached on disk.
+
+    The transport is injectable so the whole retry and parsing path is testable
+    without a network — and so no test can ever spend a real $0.025 per source.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        artifact_dir: Path,
+        model: str,
+        max_sources: int,
+        base_url: str = "https://api.x.ai/v1",
+        transport: Transport | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._dir = Path(artifact_dir) / "pulses"
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._api_key = api_key
+        self._model = model
+        self._max_sources = max_sources
+        self._base_url = base_url.rstrip("/")
+        self._transport = transport or self._http
+        self._now = now or (lambda: datetime.now(UTC))
+
+    async def fetch(self, topic: str, handles: list[str]) -> tuple[PulseArtifact, int]:
+        """Ask xAI for a digest. Raises `PulseError` with a user-facing reason."""
+        asked_at = self._now()
+        messages = [
+            {"role": "system", "content": PULSE_PROMPT},
+            {"role": "user", "content": user_prompt(topic, handles)},
+        ]
+        body = {
+            "model": self._model,
+            "messages": messages,
+            "search_parameters": build_search_parameters(
+                handles, now=asked_at, max_sources=self._max_sources
+            ),
+            "response_format": {"type": "json_object"},
+        }
+
+        problem = "no response"
+        for attempt in (1, 2):
+            try:
+                payload = await self._transport(body)
+            except Exception as exc:  # noqa: BLE001 — httpx raises its own types
+                raise PulseError(f"xAI request failed: {type(exc).__name__}") from exc
+
+            content = _content_of(payload)
+            try:
+                digest, dropped = parse_digest(
+                    content, topic=topic, asked_at=asked_at, handles=handles
+                )
+            except ValueError as exc:
+                problem = str(exc)
+                log.warning("Pulse attempt %d unusable: %s", attempt, problem)
+                # Naming the fault matters: a bare retry usually fails identically.
+                body = {
+                    **body,
+                    "messages": [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your previous reply was unusable — {problem}. "
+                                "Reply with the JSON object only, no prose, no fences."
+                            ),
+                        },
+                    ],
+                }
+                continue
+
+            artifact = self._artifact(digest, payload, asked_at)
+            self._write(artifact)
+            return artifact, dropped
+
+        raise PulseError(f"xAI returned an unusable response: {problem}")
+
+    def _artifact(
+        self, digest: PulseDigest, payload: dict, asked_at: datetime
+    ) -> PulseArtifact:
+        usage = payload.get("usage") or {}
+        # Falling back to the full cap keeps the budget honest: under-counting spend
+        # is the one direction that lets the guard be walked straight through.
+        sources = int(usage.get("num_sources_used") or self._max_sources)
+        tokens = price(
+            self._model,
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+        )
+        return PulseArtifact(
+            digest=digest,
+            raw_response=payload,
+            fetched_at=asked_at,
+            model=self._model,
+            sources_used=sources,
+            cost_usd=(tokens or 0.0) + sources * SOURCE_COST_USD,
+        )
+
+    def _write(self, artifact: PulseArtifact) -> None:
+        path = self._dir / f"{pulse_id(artifact.digest.topic, artifact.digest.asked_at)}.json"
+        try:
+            path.write_text(artifact.model_dump_json(indent=1), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - disk-level failure
+            # Not fatal for this run, but the digest is gone for good and it cost money.
+            log.warning("Could not cache pulse %s: %s", path.name, exc)
+
+    async def _http(self, body: dict) -> dict:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=body,
+            )
+            response.raise_for_status()
+            return response.json()
+
+
+def _content_of(payload: dict) -> str:
+    try:
+        return str(payload["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""

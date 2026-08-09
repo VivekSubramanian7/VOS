@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from vos.contracts import PulseError
 from vos.pulse import (
+    SOURCE_COST_USD,
+    PulseFetcher,
     build_search_parameters,
     canonical_post_url,
     normalise_handle,
@@ -214,3 +218,116 @@ def test_a_payload_with_no_posts_is_valid_not_an_error():
     )
     assert digest.posts == []
     assert dropped == 0
+
+
+# -- PulseFetcher ------------------------------------------------------------ #
+
+
+def _response(content: str, *, sources: int = 3) -> dict:
+    return {
+        "choices": [{"message": {"content": content}}],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "num_sources_used": sources,
+        },
+    }
+
+
+class StubTransport:
+    """Records request bodies and replays canned responses in order."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.bodies: list[dict] = []
+
+    async def __call__(self, body: dict) -> dict:
+        self.bodies.append(body)
+        result = self.responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _fetcher(tmp_path: Path, transport) -> PulseFetcher:
+    return PulseFetcher(
+        api_key="test-key",
+        artifact_dir=tmp_path,
+        model="grok-4.1-fast",
+        max_sources=25,
+        transport=transport,
+        now=lambda: NOW,
+    )
+
+
+async def test_fetch_returns_a_digest(tmp_path: Path):
+    fetcher = _fetcher(tmp_path, StubTransport(_response(_payload())))
+    artifact, dropped = await fetcher.fetch("AI", [])
+    assert dropped == 0
+    assert artifact.digest.posts[0].author_handle == "@karpathy"
+    assert artifact.model == "grok-4.1-fast"
+
+
+async def test_the_digest_is_cached_to_disk(tmp_path: Path):
+    """A digest cannot be re-derived tomorrow and re-asking costs money."""
+    fetcher = _fetcher(tmp_path, StubTransport(_response(_payload())))
+    await fetcher.fetch("AI", [])
+    assert list((tmp_path / "pulses").glob("*.json"))
+
+
+async def test_an_invalid_response_is_retried_once(tmp_path: Path):
+    transport = StubTransport(_response("not json"), _response(_payload()))
+    fetcher = _fetcher(tmp_path, transport)
+    artifact, _ = await fetcher.fetch("AI", [])
+    assert artifact.digest.posts
+    assert len(transport.bodies) == 2
+
+
+async def test_the_retry_tells_the_model_what_was_wrong(tmp_path: Path):
+    """A bare retry would most likely fail the same way."""
+    transport = StubTransport(_response("not json"), _response(_payload()))
+    fetcher = _fetcher(tmp_path, transport)
+
+    await fetcher.fetch("AI", [])
+    retry_messages = transport.bodies[1]["messages"]
+    assert "not JSON" in retry_messages[-1]["content"]
+
+
+async def test_two_invalid_responses_raise(tmp_path: Path):
+    transport = StubTransport(_response("nope"), _response("still nope"))
+    fetcher = _fetcher(tmp_path, transport)
+    with pytest.raises(PulseError, match="unusable"):
+        await fetcher.fetch("AI", [])
+
+
+async def test_a_transport_failure_raises_pulse_error(tmp_path: Path):
+    """The user sees "couldn't fetch", not an httpx traceback."""
+    fetcher = _fetcher(tmp_path, StubTransport(RuntimeError("connection reset")))
+    with pytest.raises(PulseError):
+        await fetcher.fetch("AI", [])
+
+
+async def test_cost_counts_sources_and_tokens(tmp_path: Path):
+    fetcher = _fetcher(tmp_path, StubTransport(_response(_payload(), sources=10)))
+    artifact, _ = await fetcher.fetch("AI", [])
+    assert artifact.sources_used == 10
+    assert artifact.cost_usd is not None
+    assert artifact.cost_usd >= 10 * SOURCE_COST_USD
+
+
+async def test_cost_assumes_the_full_cap_when_usage_is_missing(tmp_path: Path):
+    """Under-counting spend would let the budget guard be walked straight through."""
+    response = _response(_payload())
+    del response["usage"]
+    fetcher = _fetcher(tmp_path, StubTransport(response))
+    artifact, _ = await fetcher.fetch("AI", [])
+    assert artifact.cost_usd is not None
+    assert artifact.cost_usd >= 25 * SOURCE_COST_USD
+
+
+async def test_followed_handles_reach_the_request(tmp_path: Path):
+    transport = StubTransport(_response(_payload()))
+    fetcher = _fetcher(tmp_path, transport)
+    await fetcher.fetch("AI", ["@karpathy"])
+    params = transport.bodies[0]["search_parameters"]
+    assert params["sources"][0]["x_handles"] == ["karpathy"]
