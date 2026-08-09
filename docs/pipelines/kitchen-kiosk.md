@@ -71,6 +71,10 @@ through `tailscale serve`. Do not open firewall ports for it; none are needed.
 - **Capture** mode: tap the dial, talk, tap again. What Whisper heard appears in an
   editable card — fix it, hit **Save it**. The reply says which category it was filed
   under. Typing in the text field works too.
+- A capture classified **Shopping** also has its items extracted onto the shopping
+  list, and the reply names them. The kiosk is an *add-only* door to that list:
+  ticking items off stays on Telegram (`/shopping` buttons, `/bought`), where the
+  tap-to-buy keyboard lives.
 - **Ask** mode: same flow, but the confirmed text goes to the chat agent, which can
   search thoughts, video notes and X posts (read-only) or just answer generally.
 - A capture that cannot be classified right now (budget, provider down) is still

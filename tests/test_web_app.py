@@ -355,6 +355,152 @@ async def test_capture_rejects_blank_text(tmp_path: Path):
     assert resp.status_code == 400
 
 
+# --- /api/capture: shopping extraction -------------------------------------- #
+
+
+class FakeShoppingStore:
+    def __init__(self) -> None:
+        self.added: list[tuple] = []
+        self.extractions: list[tuple] = []
+
+    async def add(self, thought_id, items, captured_at) -> None:
+        self.added.append((thought_id, items))
+
+    async def record_extraction(self, thought_id, error=None) -> None:
+        self.extractions.append((thought_id, error))
+
+
+class FakeShoppingPipeline:
+    def __init__(self, names: list[str] | None = None, error: str | None = None) -> None:
+        self.names = names or []
+        self.error = error
+        self.calls = 0
+
+    async def ainvoke(self, state) -> dict:
+        from vos.contracts import ShoppingExtraction, ShoppingItem
+
+        self.calls += 1
+        if self.error:
+            return {"extraction": None, "error": self.error}
+        return {
+            "extraction": ShoppingExtraction(
+                items=[ShoppingItem(name=n) for n in self.names]
+            ),
+            "error": None,
+        }
+
+
+def _shopping_classification():
+    from vos.contracts import Classification
+
+    return Classification(
+        category="Shopping", title="Groceries", summary="Buy oat milk and eggs."
+    )
+
+
+async def test_kitchen_shopping_capture_lands_on_the_list(tmp_path: Path):
+    """The kiosk is an add-only door to the shopping list: a Shopping-classified
+    capture extracts items exactly as the Telegram path does."""
+    store = FakeShoppingStore()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(_shopping_classification()),
+                jobs=jobs,
+                shopping=store,
+                shopping_pipeline=FakeShoppingPipeline(["oat milk", "eggs"]),
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/capture", json=_capture_body(text="oat milk and eggs")
+            )
+    finally:
+        await jobs.stop()
+
+    body = resp.json()
+    assert body["status"] == "classified"
+    assert body["items"] == ["oat milk", "eggs"]
+    (added,) = store.added
+    assert added[0] == kitchen_thought_id("c-1")
+    assert [i.name for i in added[1]] == ["oat milk", "eggs"]
+
+
+async def test_non_shopping_capture_never_touches_the_list(tmp_path: Path):
+    store = FakeShoppingStore()
+    pipeline = FakeShoppingPipeline(["should not appear"])
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(_classification()),  # TripPlanning
+                jobs=jobs,
+                shopping=store,
+                shopping_pipeline=pipeline,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+    finally:
+        await jobs.stop()
+
+    assert resp.json()["status"] == "classified"
+    assert "items" not in resp.json()
+    assert store.added == []
+    assert pipeline.calls == 0
+
+
+async def test_failed_extraction_does_not_fail_the_capture(tmp_path: Path):
+    store = FakeShoppingStore()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(_shopping_classification()),
+                jobs=jobs,
+                shopping=store,
+                shopping_pipeline=FakeShoppingPipeline(error="model exploded"),
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+    finally:
+        await jobs.stop()
+
+    body = resp.json()
+    assert body["status"] == "classified"  # the thought is filed regardless
+    assert "items" not in body
+    assert store.added == []
+    # The failure is recorded so the startup recovery loop retries it.
+    assert store.extractions[-1][1] == "model exploded"
+
+
+async def test_shopping_extraction_skipped_when_kiosk_lacks_the_store(tmp_path: Path):
+    """Kiosk without shopping wired (extra not configured) must still capture."""
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(_shopping_classification()),
+                jobs=jobs,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+    finally:
+        await jobs.stop()
+    assert resp.json()["status"] == "classified"
+
+
 # --- /api/chat -------------------------------------------------------------- #
 
 

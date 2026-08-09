@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from vos.contracts import CaptureRecord, InputSource
-from vos.projection import classify_one
+from vos.projection import classify_one, process_shopping
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,8 @@ class KioskDeps:
     budget: Any = None
     cassette: Any = None
     chat_agent: Any = None
+    shopping: Any = None
+    shopping_pipeline: Any = None
     pin: str | None = None
     classify_timeout_s: float = 12.0
     """How long the capture endpoint waits for enrichment before answering
@@ -152,6 +154,28 @@ def build_web_app(deps: KioskDeps) -> FastAPI:
         # From here the thought is safe; enrichment may fail without losing it.
         fut: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
 
+        async def _extract_shopping(record: CaptureRecord, classification) -> list[str] | None:
+            """A Shopping capture from the kitchen goes onto the list, exactly as it
+            would from Telegram. The kiosk only ever *adds* — ticking items off stays
+            a Telegram action. Runs inside the same queued job (still one writer);
+            None means extraction did not run or produced nothing to report."""
+            if classification.category != "Shopping":
+                return None
+            if deps.shopping is None or deps.shopping_pipeline is None:
+                return None
+            if deps.budget is not None and deps.budget.exceeded():
+                # Silent, like the shell: the thought stays unextracted and the next
+                # restart's recovery loop re-queues it.
+                return None
+            try:
+                result = await process_shopping(deps.shopping_pipeline, deps.shopping, record)
+            except Exception:  # noqa: BLE001 — the capture is already safe and filed
+                log.exception("Kiosk shopping extraction failed for %s", record.id)
+                return None
+            if not result.ok:
+                return None
+            return [item.name for item in result.items]
+
         async def enrich() -> None:
             try:
                 await deps.graph.upsert_thought(record, None)
@@ -171,6 +195,9 @@ def build_web_app(deps: KioskDeps) -> FastAPI:
                             "category": classification.category,
                             "title": classification.title,
                         }
+                        items = await _extract_shopping(record, classification)
+                        if items is not None:
+                            outcome["items"] = items
                     else:
                         outcome = {"status": "unclassified", "error": error}
             except Exception as exc:  # noqa: BLE001 — e.g. the graph is down

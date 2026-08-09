@@ -965,6 +965,8 @@ async def run() -> None:
                 transcriber=FasterWhisperTranscriber(settings.vos_whisper_model),
                 budget=budget,
                 cassette=cassette,
+                shopping=shopping,
+                shopping_pipeline=shopping_pipeline,
                 chat_agent=KitchenChat(
                     model,
                     graph,

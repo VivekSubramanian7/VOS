@@ -181,7 +181,11 @@ async function capture(text, { source, transcript }) {
       return;
     }
     if (body.status === "classified") {
-      bubble(`Saved: ${body.title}`, "bot", { meta: `Filed under ${body.category}` });
+      let meta = `Filed under ${body.category}`;
+      if (body.items && body.items.length) {
+        meta += ` · on the shopping list: ${body.items.join(", ")}`;
+      }
+      bubble(`Saved: ${body.title}`, "bot", { meta });
     } else if (body.status === "pending") {
       bubble("Saved. Filing takes a moment — it'll appear under pending.", "bot");
     } else {
