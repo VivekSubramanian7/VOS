@@ -608,6 +608,39 @@ async def run() -> None:
     if requeued := await vos.requeue_unprocessed_videos(announce):
         log.info("Re-queued %d unprocessed video(s).", requeued)
 
+    # The kitchen kiosk shares this process — one event loop, one JobQueue, one
+    # writer (ADR-008). Lazy imports: the kiosk extra may not be installed, and an
+    # unset flag must change nothing.
+    web_task = web_server = None
+    if settings.vos_kiosk_enabled:
+        from vos.web.app import KioskDeps, build_web_app, start_server
+        from vos.web.stt import FasterWhisperTranscriber
+
+        kiosk_app = build_web_app(
+            KioskDeps(
+                journal=journal,
+                graph=graph,
+                pipeline=pipeline,
+                jobs=jobs,
+                transcriber=FasterWhisperTranscriber(settings.vos_whisper_model),
+                budget=budget,
+                cassette=cassette,
+                pin=(
+                    settings.vos_kiosk_pin.get_secret_value()
+                    if settings.vos_kiosk_pin
+                    else None
+                ),
+            )
+        )
+        web_task, web_server = start_server(
+            kiosk_app, settings.vos_kiosk_host, settings.vos_kiosk_port
+        )
+        log.info(
+            "Kiosk serving on %s:%d (reach it via `tailscale serve`).",
+            settings.vos_kiosk_host,
+            settings.vos_kiosk_port,
+        )
+
     dp = Dispatcher()
     dp.update.outer_middleware(AllowOnlyOwner(settings.vos_allowed_user_id))
     dp.include_router(vos.router())
@@ -616,6 +649,12 @@ async def run() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        # Web first: it feeds the job queue, so it must stop accepting before the
+        # queue drains. Five seconds, then the rest of shutdown proceeds regardless.
+        if web_server is not None and web_task is not None:
+            web_server.should_exit = True
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(web_task, timeout=5)
         await jobs.stop()
         await graph.close()
         await bot.session.close()
