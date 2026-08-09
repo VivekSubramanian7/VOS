@@ -83,6 +83,36 @@ async def test_redelivered_telegram_update_is_one_thought(graph: Neo4jGraph):
     assert (await graph.stats()).total == 1
 
 
+async def test_kitchen_capture_persists_its_channel(graph: Neo4jGraph):
+    """`channel` is what lets 'where did this come from?' be answered later; it must
+    survive the projection, and re-projection must not duplicate the node."""
+    record = CaptureRecord.create_kitchen(
+        client_id="c-9",
+        text="buy milk",
+        captured_at=datetime.now(UTC),
+        source="voice",
+        transcript="by milk",
+    )
+    await graph.upsert_thought(record, None)
+    await graph.upsert_thought(record, None)
+
+    rows = await graph._run(
+        "MATCH (t:Thought {id: $id}) RETURN t.channel AS channel, count(t) AS n",
+        id=str(record.id),
+    )
+    assert rows[0]["channel"] == "kitchen"
+    assert rows[0]["n"] == 1
+
+
+async def test_telegram_capture_channel_defaults(graph: Neo4jGraph):
+    record = _record()
+    await graph.upsert_thought(record, None)
+    rows = await graph._run(
+        "MATCH (t:Thought {id: $id}) RETURN t.channel AS channel", id=str(record.id)
+    )
+    assert rows[0]["channel"] == "telegram"
+
+
 async def test_reclassification_replaces_rather_than_accumulates(graph: Neo4jGraph):
     """A prompt change must not leave the old category and entities behind."""
     record = _record()

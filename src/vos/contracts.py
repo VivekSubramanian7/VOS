@@ -50,6 +50,10 @@ EntityType = Literal["person", "place", "product", "org", "ticker", "topic", "ur
 SourceKind = Literal["person", "book", "channel", "x"]
 InputSource = Literal["text", "voice"]
 
+Channel = Literal["telegram", "kitchen"]
+"""Where a capture physically came from. Orthogonal to `InputSource`: a kitchen
+capture is usually voice but can be typed, and Telegram may grow voice later."""
+
 Status = Literal["captured", "classified", "unclassified", "deleted"]
 """captured    — in the journal and the graph, not yet classified
 classified  — enrichment succeeded
@@ -75,6 +79,17 @@ def thought_id(chat_id: int, message_id: int) -> UUID:
     return uuid5(NAMESPACE_VOS, f"{chat_id}:{message_id}")
 
 
+def kitchen_thought_id(client_id: str) -> UUID:
+    """Deterministic ID for a kiosk capture, keyed on a browser-generated UUID.
+
+    The tablet's version of redelivery is a retried POST after a dropped response:
+    same `client_id`, same ID, so the journal and `MERGE` collapse it exactly like a
+    Telegram redelivery. The `kitchen:` prefix is a separate keyspace — no client_id,
+    however shaped, can produce an ID that collides with a Telegram capture.
+    """
+    return uuid5(NAMESPACE_VOS, f"kitchen:{client_id}")
+
+
 # --------------------------------------------------------------------------- #
 # Journal record — the source of truth
 # --------------------------------------------------------------------------- #
@@ -98,6 +113,8 @@ class CaptureRecord(BaseModel):
     source: InputSource = "text"
     transcript: str | None = None
     captured_at: datetime
+    channel: Channel = "telegram"
+    """Defaulted so every journal line written before the kiosk existed still parses."""
 
     @classmethod
     def create(
@@ -118,6 +135,30 @@ class CaptureRecord(BaseModel):
             source=source,
             transcript=transcript,
             captured_at=captured_at,
+        )
+
+    @classmethod
+    def create_kitchen(
+        cls,
+        *,
+        client_id: str,
+        text: str,
+        captured_at: datetime,
+        source: InputSource = "voice",
+        transcript: str | None = None,
+    ) -> CaptureRecord:
+        """A capture from the kitchen kiosk. `text` is what the user confirmed after
+        correcting the transcript; `transcript` keeps Whisper's raw output. Zeros for
+        the Telegram identity are sentinels — there is no chat behind this record."""
+        return cls(
+            id=kitchen_thought_id(client_id),
+            chat_id=0,
+            message_id=0,
+            text=text,
+            source=source,
+            transcript=transcript,
+            captured_at=captured_at,
+            channel="kitchen",
         )
 
 
