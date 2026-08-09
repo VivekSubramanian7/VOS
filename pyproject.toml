@@ -34,6 +34,15 @@ dev = [
     "ruff>=0.7",
     "testcontainers[neo4j]>=4.8",
 ]
+# The kitchen kiosk web surface. Optional because faster-whisper drags ctranslate2 +
+# onnxruntime + av (hundreds of MB); the daemon must stay installable without it, and
+# vos.web is only imported when VOS_KIOSK_ENABLED is set.
+kiosk = [
+    "fastapi>=0.115",
+    "uvicorn>=0.35",
+    "python-multipart>=0.0.20",
+    "faster-whisper>=1.1",
+]
 
 [project.scripts]
 vos = "vos.cli:main"
