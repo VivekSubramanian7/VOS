@@ -42,6 +42,10 @@ PRICING: dict[str, tuple[float, float]] = {
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.1-pro-preview": (2.00, 12.00),
     "gemini-2.5-pro": (1.25, 10.00),
+    # Family fallback — PRICING matches by substring, longest key first, so this
+    # covers every grok variant. Token cost is a rounding error next to Live
+    # Search's $0.025/source, so an approximate rate is honest here.
+    "grok": (1.25, 2.50),
 }
 
 

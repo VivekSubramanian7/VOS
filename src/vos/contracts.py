@@ -47,7 +47,7 @@ CATEGORIES: tuple[str, ...] = (
 )
 
 EntityType = Literal["person", "place", "product", "org", "ticker", "topic", "url"]
-SourceKind = Literal["person", "book", "channel"]
+SourceKind = Literal["person", "book", "channel", "x"]
 InputSource = Literal["text", "voice"]
 
 Status = Literal["captured", "classified", "unclassified", "deleted"]
@@ -417,3 +417,124 @@ class GraphStore(Protocol):
     async def following(self) -> list[SourceRef]: ...
     async def pending(self) -> list[ThoughtView]: ...
     async def existing_ids(self) -> set[UUID]: ...
+
+
+# --------------------------------------------------------------------------- #
+# X pulse — trending posts as knowledge
+# --------------------------------------------------------------------------- #
+
+NAMESPACE_PULSE = UUID("8b2e4d61-7a09-4c3f-b5d8-1e6a9c40f273")
+NAMESPACE_POST = UUID("d4a7c918-3e52-4f6b-8c01-5b9d2e7a6f14")
+
+
+def pulse_id(topic: str, asked_at: datetime) -> UUID:
+    """One digest run. `asked_at` is part of the key because two digests on the same
+    topic hours apart are different digests, not a repeat of one."""
+    return uuid5(NAMESPACE_PULSE, f"{topic.strip().casefold()}:{asked_at.isoformat()}")
+
+
+def post_id(url: str) -> UUID:
+    """Keyed on the post URL, so the same post appearing in several digests stays one
+    node with several `HAS_POST` edges rather than a duplicate per digest."""
+    return uuid5(NAMESPACE_POST, url.strip())
+
+
+class PulsePost(BaseModel):
+    """One item from a digest. These field descriptions are part of the prompt."""
+
+    text: str = Field(
+        max_length=300,
+        description="The claim or news in one self-contained sentence, not a teaser",
+    )
+    author_handle: str = Field(description="The posting account as @handle")
+    url: str = Field(description="Direct link to the post, x.com/<handle>/status/<id>")
+    section: str | None = Field(
+        default=None,
+        max_length=40,
+        description="A 2-4 word heading grouping related items, reused across them",
+    )
+    score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How much this is worth remembering months from now. "
+            "0.9-1.0: a concrete release, benchmark number, or falsifiable claim. "
+            "0.5-0.7: real news but widely covered. "
+            "0.0-0.3: opinion, hype, or self-promotion."
+        ),
+    )
+    """Drives both which posts are shown and the order they are shown in.
+
+    Anchored explicitly because that text reaches the model: asked for an unqualified
+    0-1 score it rates almost everything highly, and a ranking where everything is
+    0.9 is not a ranking. Same reasoning as `VideoNote.score`.
+    """
+
+
+class PulseDigest(BaseModel):
+    topic: str
+    summary: str = Field(max_length=600, description="Two or three sentences")
+    posts: list[PulsePost] = Field(default_factory=list)
+    asked_at: datetime
+    handles: list[str] = Field(default_factory=list)
+    """Which followed handles the search was filtered on. Recorded so a thin digest
+    can be explained later — an empty list means it was an unfiltered trending search."""
+
+
+class PulseArtifact(BaseModel):
+    """A fetched digest, cached on disk.
+
+    Non-recomputable, like a transcript: Grok's answer at a moment in time cannot be
+    re-derived tomorrow, and re-asking costs real money. Treated as an input alongside
+    the journal — backed up, never auto-pruned.
+    """
+
+    digest: PulseDigest
+    raw_response: dict
+    fetched_at: datetime
+    model: str
+    sources_used: int = 0
+    cost_usd: float | None = None
+
+
+class PostView(BaseModel):
+    """A post as read back out of the projection."""
+
+    id: UUID
+    text: str
+    author_handle: str
+    url: str
+    section: str | None = None
+    score: float = 0.5
+    topic: str
+    asked_at: datetime
+
+    @property
+    def deep_link(self) -> str:
+        return self.url
+
+
+class PulseResult(BaseModel):
+    """Outcome of one /pulse — what the user is told."""
+
+    topic: str
+    digest: PulseDigest | None = None
+    post_count: int = 0
+    error: str | None = None
+    dropped: int = 0
+    """Items discarded for having no usable post link. Reported rather than swallowed:
+    an unverifiable link is worse than a missing one because it still looks checkable."""
+    cost_usd: float | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.digest is not None
+
+
+class PulseError(Exception):
+    """Raised when a digest cannot be fetched. Carries a message fit to show the user."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason

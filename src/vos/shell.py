@@ -19,6 +19,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from html import escape
 from typing import Any
 from uuid import UUID
 
@@ -33,13 +34,16 @@ from vos.contracts import CaptureRecord, CaptureResult, SourceKind, SourceRef
 from vos.graph import Neo4jGraph
 from vos.jobs import JobQueue
 from vos.journal import JsonlJournal
-from vos.projection import classify_one, process_video, reproject_missing
+from vos.projection import classify_one, process_video, reproject_missing, run_pulse
+from vos.pulse import normalise_handle
 from vos.render import (
     HELP,
     render_all_notes,
+    render_all_posts,
     render_capture,
     render_following,
-    render_notes,
+    render_pulse,
+    render_search,
     render_stats,
     render_thoughts,
     render_video,
@@ -90,6 +94,8 @@ class VosBot:
         budget: BudgetGuard | None = None,
         video_pipeline: Any = None,
         jobs: JobQueue | None = None,
+        pulse_fetcher: Any = None,
+        pulse_topic: str = "AI",
     ) -> None:
         self.journal = journal
         self.graph = graph
@@ -98,6 +104,8 @@ class VosBot:
         self.budget = budget
         self.video_pipeline = video_pipeline
         self.jobs = jobs
+        self.pulse_fetcher = pulse_fetcher
+        self.pulse_topic = pulse_topic
 
     # -- capture -------------------------------------------------------- #
 
@@ -222,6 +230,50 @@ class VosBot:
             return
         await self._queue_video(message.answer, video_id, None)
 
+    # -- pulse ---------------------------------------------------------- #
+
+    async def cmd_pulse(self, message: Message, command: CommandObject) -> None:
+        """Best of the last 24 hours on X.
+
+        Queued rather than inline: the search takes 10-30s and the polling loop must
+        not stall. The budget is checked *before* queueing — a digest costs real money
+        per source, so refusing early is the whole point of the guard.
+        """
+        if self.pulse_fetcher is None:
+            await message.answer(
+                "🐦 X pulse isn't enabled.\n"
+                "Add <code>XAI_API_KEY=…</code> to your .env and restart.\n"
+                "Keys come from <a href=\"https://console.x.ai\">console.x.ai</a>."
+            )
+            return
+        if self.jobs is None:
+            await message.answer("Background jobs aren't enabled.")
+            return
+        if self.budget and self.budget.exceeded():
+            await message.answer(
+                f"💸 Daily budget reached (${self.budget.spent_today():.2f}). "
+                "No pulse — it would cost around $0.63."
+            )
+            return
+
+        topic = (command.args or "").strip() or self.pulse_topic
+
+        async def job() -> None:
+            note = await message.answer(f"🐦 Reading X for “{escape(topic)}”…")
+            try:
+                result = await run_pulse(
+                    self.pulse_fetcher, self.graph, topic, cassette=self.cassette
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Pulse job failed for %s", topic)
+                await note.edit_text(
+                    f"🐦 Pulse failed: <i>{type(exc).__name__}</i>."
+                )
+                return
+            await _replace(note, message.answer, render_pulse(result))
+
+        await self.jobs.submit(f"pulse:{topic}", job)
+
     async def cmd_more(self, message: Message, command: CommandObject) -> None:
         """Every stored claim for a video, not just the ones the reply had room for.
 
@@ -237,11 +289,22 @@ class VosBot:
                 await message.answer("Usage: <code>/more</code> or <code>/more &lt;url&gt;</code>")
                 return
         else:
-            recent = await self.graph.all_video_ids()
-            if not recent:
-                await message.answer("No videos processed yet.")
+            # Whichever the user was most recently looking at, derived from the graph
+            # rather than held as session state — the same trick /undo uses.
+            pulse = await self.graph.latest_pulse()
+            video = await self.graph.latest_video()
+            if pulse and (video is None or pulse[1] >= video[1]):
+                posts = await self.graph.posts_for_pulse(pulse[0])
+                if posts:
+                    await _send(message.answer, render_all_posts(posts))
+                    return
+                # A quiet day still MERGEs a :Pulse node with zero posts. Without this
+                # fallback, that empty pulse would permanently block bare /more from
+                # ever reaching the video notes again.
+            if video is None:
+                await message.answer("Nothing processed yet.")
                 return
-            video_id = recent[0]
+            video_id = video[0]
 
         notes = await self.graph.notes_for_video(video_id)
         await _send(message.answer, render_all_notes(notes))
@@ -250,10 +313,10 @@ class VosBot:
         if not command.args:
             await message.answer("Usage: <code>/notes leverage</code>")
             return
-        notes = await self.graph.search_notes(command.args.strip(), 15)
-        await _send(
-            message.answer, render_notes(notes, f"Notes matching “{command.args.strip()}”")
-        )
+        term = command.args.strip()
+        notes = await self.graph.search_notes(term, 10)
+        posts = await self.graph.search_posts(term, 10)
+        await _send(message.answer, render_search(notes, posts, term))
 
     async def requeue_unprocessed_videos(
         self, answer: Callable[[str], Awaitable[Any]]
@@ -354,7 +417,8 @@ class VosBot:
                 "Usage:\n"
                 "<code>/follow person Naval Ravikant</code>\n"
                 "<code>/follow book Sapiens by Harari</code>\n"
-                "<code>/follow channel https://youtube.com/@veritasium</code>"
+                "<code>/follow channel https://youtube.com/@veritasium</code>\n"
+                "<code>/follow x @karpathy</code>"
             )
             return
         await self.graph.follow(source)
@@ -399,6 +463,7 @@ class VosBot:
         r.message.register(self.cmd_following, Command("following"))
         r.message.register(self.cmd_video, Command("video"))
         r.message.register(self.cmd_redistil, Command("redistil"))
+        r.message.register(self.cmd_pulse, Command("pulse"))
         r.message.register(self.cmd_notes, Command("notes"))
         r.message.register(self.cmd_more, Command("more"))
         r.message.register(self.on_voice, F.voice | F.audio | F.video_note)
@@ -433,9 +498,18 @@ def _parse_follow(args: str) -> SourceRef | None:
     if len(parts) < 2:
         return None
     kind_raw, rest = parts[0].casefold(), parts[1].strip()
-    if kind_raw not in ("person", "book", "channel"):
+    if kind_raw not in ("person", "book", "channel", "x"):
         return None
     kind: SourceKind = kind_raw  # type: ignore[assignment]
+
+    if kind == "x":
+        # Stored as @handle so it matches the author on a post and reaches xAI bare.
+        handle = normalise_handle(rest)
+        if handle is None:
+            return None
+        return SourceRef(
+            name=handle, kind="x", url=f"https://x.com/{handle.lstrip('@')}"
+        )
 
     author = None
     if kind == "book" and " by " in rest:
@@ -498,6 +572,18 @@ async def run() -> None:
     jobs = JobQueue(concurrency=1)  # single writer — see ADR-008
     await jobs.start()
 
+    pulse_fetcher = None
+    if settings.xai_api_key is not None:
+        from vos.pulse import PulseFetcher
+
+        pulse_fetcher = PulseFetcher(
+            api_key=settings.xai_api_key.get_secret_value(),
+            artifact_dir=settings.vos_artifact_dir,
+            model=settings.vos_pulse_model,
+            max_sources=settings.vos_pulse_max_sources,
+            base_url=settings.vos_xai_base_url,
+        )
+
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -510,6 +596,8 @@ async def run() -> None:
         budget=budget,
         video_pipeline=video_pipeline,
         jobs=jobs,
+        pulse_fetcher=pulse_fetcher,
+        pulse_topic=settings.vos_pulse_topic,
     )
 
     async def announce(text: str):

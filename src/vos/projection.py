@@ -22,7 +22,14 @@ from collections.abc import Iterable
 from datetime import datetime
 from uuid import UUID
 
-from vos.contracts import CaptureRecord, Classification, VideoResult
+from vos.contracts import (
+    CaptureRecord,
+    Classification,
+    PulseError,
+    PulseResult,
+    VideoResult,
+    pulse_id,
+)
 from vos.graph import Neo4jGraph
 from vos.journal import JsonlJournal
 from vos.pipeline import ThoughtState
@@ -125,8 +132,48 @@ async def process_video(
         distillation=distillation,
         note_count=count,
         truncated=bool(out.get("truncated")),
-        notes_dropped=int(out.get("notes_dropped") or 0),
         is_generated=artifact.is_generated,
+    )
+
+
+async def run_pulse(
+    fetcher, graph: Neo4jGraph, topic: str, *, cassette=None
+) -> PulseResult:
+    """Fetch one digest and project it.
+
+    Mirrors `process_video`: the fetcher produces data, this writes it, and a
+    failure is reported rather than raised — a digest that could not be fetched
+    costs the user a message, not a crash.
+    """
+    handles = [s.name for s in await graph.following() if s.kind == "x"]
+
+    try:
+        artifact, dropped = await fetcher.fetch(topic, handles)
+    except PulseError as exc:
+        return PulseResult(topic=topic, error=exc.reason)
+
+    # Recorded before the graph write, deliberately. The money left the account the
+    # moment xAI answered; if the projection then fails, BudgetGuard must still know.
+    if cassette is not None:
+        from vos.cassette import CassetteEntry
+
+        with contextlib.suppress(Exception):
+            cassette.record(
+                CassetteEntry(
+                    thought_id=pulse_id(topic, artifact.digest.asked_at),
+                    model=artifact.model,
+                    prompt=f"pulse:{topic}",
+                    cost_usd=artifact.cost_usd,
+                )
+            )
+
+    count = await graph.save_pulse(artifact.digest)
+    return PulseResult(
+        topic=topic,
+        digest=artifact.digest,
+        post_count=count,
+        dropped=dropped,
+        cost_usd=artifact.cost_usd,
     )
 
 
