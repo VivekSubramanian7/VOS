@@ -177,6 +177,7 @@ class Neo4jGraph:
             SET t.text       = $text,
                 t.source     = $source,
                 t.transcript = $transcript,
+                t.channel    = $channel,
                 t.created_at = $created_at,
                 t.status     = CASE WHEN t.status = 'deleted' THEN 'deleted' ELSE $status END
             """,
@@ -184,6 +185,7 @@ class Neo4jGraph:
             text=record.text,
             source=record.source,
             transcript=record.transcript,
+            channel=record.channel,
             created_at=record.captured_at,
             status=status,
         )

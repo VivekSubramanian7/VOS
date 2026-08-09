@@ -114,6 +114,50 @@ def test_pulse_defaults():
     assert settings.vos_pulse_topic == "AI"
 
 
+def test_kiosk_is_off_by_default(tmp_path, monkeypatch):
+    """An unset VOS_KIOSK_ENABLED must change nothing about the running bot.
+
+    Isolated from the developer's real .env (which may legitimately enable the
+    kiosk) by running in an empty cwd with the variable scrubbed.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VOS_KIOSK_ENABLED", raising=False)
+    monkeypatch.delenv("VOS_KIOSK_PIN", raising=False)
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+    )
+    assert settings.vos_kiosk_enabled is False
+    assert settings.vos_kiosk_pin is None
+
+
+def test_kiosk_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+    )
+    # 127.0.0.1: reachable only through `tailscale serve`, never a physical NIC.
+    assert settings.vos_kiosk_host == "127.0.0.1"
+    assert settings.vos_kiosk_port == 8765
+    assert settings.vos_whisper_model == "small"
+    assert settings.vos_kiosk_session_ttl_s == 1800
+
+
+def test_kiosk_pin_is_a_secret():
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+        VOS_KIOSK_PIN="4321",
+    )
+    assert settings.vos_kiosk_pin is not None
+    assert "4321" not in repr(settings)
+    assert settings.vos_kiosk_pin.get_secret_value() == "4321"
+
+
 def test_pulse_source_cap_is_configurable():
     """The cap is the cost lever: 25 sources is ~$0.63 a digest at $0.025 each."""
     settings = Settings(

@@ -71,6 +71,22 @@ Ticks are written to the journal, so they survive `vos reclassify --rebuild`. Th
 itself lives in `shopping.db`, which is disposable — see
 [docs/pipelines/shopping.md](docs/pipelines/shopping.md).
 
+### Kitchen kiosk
+
+A tablet in the kitchen can talk to VOS: the daemon serves a web page where anyone in
+the family speaks a thought, corrects the locally-transcribed text, and saves it —
+or asks questions over the graph in chat. Audio never leaves the machine
+(faster-whisper runs on it), chat is ephemeral, and the page is reachable only inside
+your Tailscale tailnet — no public URL exists.
+
+```bash
+uv sync --extra kiosk                                # whisper + fastapi + uvicorn
+tailscale serve --bg http://127.0.0.1:8765   # once, after installing Tailscale
+# .env: VOS_KIOSK_ENABLED=1  (optional: VOS_KIOSK_PIN=…)
+```
+
+Full setup (tablet included) and the privacy model: `docs/pipelines/kitchen-kiosk.md`.
+
 ## Operations
 
 | Task | Command |

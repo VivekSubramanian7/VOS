@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     # row rebuilds from the journal, so it needs no backup.
     vos_shopping_db: Path = Field(default=Path("./shopping.db"), alias="VOS_SHOPPING_DB")
 
+    # --- Kitchen kiosk (optional) -----------------------------------------
+    # Disabled by default: an unset flag changes nothing about the running bot.
+    # The host default is deliberate — 127.0.0.1 is reachable only through
+    # `tailscale serve`, never from a physical network, which is the kiosk's
+    # entire exposure model. PIN is a soft second factor on top of tailnet
+    # membership, not the primary gate.
+    vos_kiosk_enabled: bool = Field(default=False, alias="VOS_KIOSK_ENABLED")
+    vos_kiosk_host: str = Field(default="127.0.0.1", alias="VOS_KIOSK_HOST")
+    vos_kiosk_port: int = Field(default=8765, alias="VOS_KIOSK_PORT")
+    vos_whisper_model: str = Field(default="small", alias="VOS_WHISPER_MODEL")
+    vos_kiosk_session_ttl_s: int = Field(default=1800, alias="VOS_KIOSK_SESSION_TTL_S")
+    vos_kiosk_pin: SecretStr | None = Field(default=None, alias="VOS_KIOSK_PIN")
+
     # --- X pulse (optional) ---------------------------------------------
     # Absent key means /pulse is off; nothing else changes. Live Search bills
     # $0.025 per source on top of tokens, so `max_sources` is the cost lever:

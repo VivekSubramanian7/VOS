@@ -148,6 +148,19 @@ async def test_records_are_chronological_regardless_of_write_order(jrnl: JsonlJo
     assert [r.text for r in jrnl.records()] == ["early", "late"]
 
 
+async def test_retried_kitchen_capture_collapses_to_one_record(jrnl: JsonlJournal):
+    """A tablet retrying a POST after a dropped response is the kitchen's version of
+    Telegram redelivery — same client_id, same ID, last write wins."""
+    when = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    first = CaptureRecord.create_kitchen(client_id="c-7", text="buy milk", captured_at=when)
+    retry = CaptureRecord.create_kitchen(client_id="c-7", text="buy milk", captured_at=when)
+    await jrnl.append(first)
+    await jrnl.append(retry)
+    (only,) = jrnl.records()
+    assert only.id == first.id
+    assert only.channel == "kitchen"
+
+
 async def test_last_capture(jrnl: JsonlJournal):
     assert jrnl.last_capture() is None
     await jrnl.append(_record(1))

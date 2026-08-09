@@ -27,6 +27,7 @@ from vos.contracts import (
     ShoppingResult,
     SourceRef,
     canonical,
+    kitchen_thought_id,
     post_id,
     pulse_id,
     thought_id,
@@ -60,6 +61,60 @@ def test_capture_record_is_frozen():
     )
     with pytest.raises(ValidationError):
         r.text = "mutated"  # type: ignore[misc]
+
+
+def test_kitchen_thought_id_is_deterministic():
+    """Same client_id → same ID: a retried POST must collapse like a redelivery."""
+    assert kitchen_thought_id("3f2c") == kitchen_thought_id("3f2c")
+
+
+def test_kitchen_thought_id_differs_between_captures():
+    assert kitchen_thought_id("a") != kitchen_thought_id("b")
+
+
+def test_kitchen_ids_live_in_their_own_keyspace():
+    # A malicious or unlucky client_id shaped like "chat:message" must not be able
+    # to collide with (and overwrite) a Telegram capture.
+    assert kitchen_thought_id("1:2") != thought_id(1, 2)
+
+
+def test_create_kitchen_derives_id_and_channel():
+    r = CaptureRecord.create_kitchen(
+        client_id="c-1",
+        text="buy milk",
+        captured_at=datetime.now(UTC),
+        source="voice",
+        transcript="by milk",
+    )
+    assert r.id == kitchen_thought_id("c-1")
+    assert r.channel == "kitchen"
+    assert r.source == "voice"
+    assert r.transcript == "by milk"
+    # No Telegram identity: sentinel zeros, never a real chat.
+    assert (r.chat_id, r.message_id) == (0, 0)
+
+
+def test_capture_record_channel_defaults_to_telegram():
+    """Every journal line written before the field existed must still parse."""
+    r = CaptureRecord.create(
+        chat_id=42, message_id=7, text="hello", captured_at=datetime.now(UTC)
+    )
+    legacy = r.model_dump(mode="json")
+    del legacy["channel"]
+    parsed = CaptureRecord.model_validate(legacy)
+    assert parsed.channel == "telegram"
+
+
+def test_capture_record_rejects_unknown_channel():
+    with pytest.raises(ValidationError):
+        CaptureRecord(
+            id=thought_id(1, 1),
+            chat_id=1,
+            message_id=1,
+            text="x",
+            captured_at=datetime.now(UTC),
+            channel="garage",  # type: ignore[arg-type]
+        )
 
 
 def test_classification_rejects_unknown_category():
