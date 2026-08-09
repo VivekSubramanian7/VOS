@@ -183,7 +183,7 @@ def render_following(sources: list[SourceRef]) -> str:
             "<code>/follow book Sapiens by Harari</code>\n"
             "<code>/follow channel https://youtube.com/@veritasium</code>"
         )
-    icon = {"person": "👤", "book": "📖", "channel": "📺"}
+    icon = {"person": "👤", "book": "📖", "channel": "📺", "x": "🐦"}
     lines = ["<b>Following</b>"]
     for s in sources:
         row = f"{icon.get(s.kind, '•')} {escape(s.name)}"

@@ -13,7 +13,7 @@ A false "captured" is the one outcome the design refuses, so it is tested direct
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -26,6 +26,9 @@ from vos.contracts import (
     Classification,
     ExtractedEntity,
     GraphStats,
+    PulseArtifact,
+    PulseDigest,
+    PulsePost,
     SourceRef,
     ThoughtView,
     Tombstone,
@@ -90,6 +93,8 @@ class FakeGraph:
         self.notes: dict[str, list] = {}
         self.captions_auto: dict[str, bool | None] = {}
         self.video_failures: dict[UUID, tuple[str, bool]] = {}
+        self.pulses: dict[str, Any] = {}
+        self.video_added_at: dict[str, datetime] = {}
         self.fail = fail
 
     async def upsert_thought(self, record, classification) -> list[str]:
@@ -162,6 +167,11 @@ class FakeGraph:
         self.videos[meta.video_id] = meta
         self.captions_auto[meta.video_id] = is_generated
         self.video_failures.pop(thought_id, None)
+        # Monotonic per insert, not wall-clock: two videos upserted within the same
+        # tick must still order deterministically for latest_video().
+        self.video_added_at[meta.video_id] = datetime.now(UTC) + timedelta(
+            microseconds=len(self.video_added_at)
+        )
 
     async def mark_video_failed(self, thought_id, reason: str, permanent: bool) -> None:
         self.video_failures[thought_id] = (reason, permanent)
@@ -171,6 +181,33 @@ class FakeGraph:
         return len(notes)
 
     async def search_notes(self, term: str, n: int = 10):
+        return []
+
+    async def save_pulse(self, digest) -> int:
+        self.pulses[str(digest.asked_at)] = digest
+        return len(digest.posts)
+
+    async def latest_pulse(self):
+        """Not hardcoded to None: bare /more shares this path with the video
+        case, so an empty fake here would make every bare /more read as
+        "nothing processed" even after a real pulse was saved."""
+        if not self.pulses:
+            return None
+        from vos.contracts import pulse_id
+
+        digest = max(self.pulses.values(), key=lambda d: d.asked_at)
+        return pulse_id(digest.topic, digest.asked_at), digest.asked_at
+
+    async def latest_video(self):
+        if not self.video_added_at:
+            return None
+        video_id = max(self.video_added_at, key=lambda k: self.video_added_at[k])
+        return video_id, self.video_added_at[video_id]
+
+    async def posts_for_pulse(self, pulse):
+        return []
+
+    async def search_posts(self, term: str, n: int = 10):
         return []
 
     async def notes_for_video(self, video_id: str):
@@ -611,10 +648,12 @@ async def test_more_defaults_to_the_most_recent_video(tmp_path: Path):
 
 
 async def test_more_with_nothing_processed_says_so(tmp_path: Path):
+    """Bare /more now covers pulses as well as videos, so the empty message
+    can no longer promise "videos" specifically."""
     bot, jobs = _video_bot(tmp_path)
     message = FakeMessage()
     await bot.cmd_more(message, FakeCommand())  # type: ignore[arg-type]
-    assert "No videos processed yet" in message.last
+    assert "Nothing processed yet" in message.last
 
 
 async def test_more_rejects_something_that_is_not_a_video(tmp_path: Path):
@@ -646,3 +685,139 @@ def test_parse_follow_sets_url_for_channels():
 )
 def test_match_category(raw, expected):
     assert _match_category(raw) == expected
+
+
+# --- pulse -------------------------------------------------------------------- #
+
+
+def test_follow_x_normalises_a_handle():
+    """`/follow x https://x.com/karpathy` and `/follow x @Karpathy` are one follow."""
+    from vos.shell import _parse_follow
+
+    for raw in ("x @Karpathy", "x karpathy", "x https://x.com/karpathy"):
+        source = _parse_follow(raw)
+        assert source is not None
+        assert source.kind == "x"
+        assert source.name == "@karpathy"
+
+
+def test_follow_x_rejects_a_non_handle():
+    from vos.shell import _parse_follow
+
+    assert _parse_follow("x not a real handle") is None
+
+
+class StubPulseFetcher:
+    def __init__(self, posts=(), error: str | None = None):
+        self.posts = list(posts)
+        self.error = error
+
+    async def fetch(self, topic: str, handles: list[str]):
+        from datetime import UTC, datetime
+
+        if self.error:
+            from vos.contracts import PulseError
+
+            raise PulseError(self.error)
+        return (
+            PulseArtifact(
+                digest=PulseDigest(
+                    topic=topic,
+                    summary="Today on X.",
+                    posts=self.posts,
+                    asked_at=datetime(2026, 8, 9, tzinfo=UTC),
+                ),
+                raw_response={},
+                fetched_at=datetime(2026, 8, 9, tzinfo=UTC),
+                model="grok-4.1-fast",
+                sources_used=25,
+                cost_usd=0.63,
+            ),
+            0,
+        )
+
+
+def _pulse_bot(tmp_path: Path, fetcher=None) -> tuple[VosBot, JobQueue]:
+    jobs = JobQueue()
+    bot = VosBot(
+        journal=JsonlJournal(tmp_path / "journal"),
+        graph=FakeGraph(),  # type: ignore[arg-type]
+        pipeline=FakePipeline(_classification()),
+        jobs=jobs,
+        pulse_fetcher=fetcher,
+    )
+    return bot, jobs
+
+
+async def test_pulse_without_a_key_explains_how_to_enable_it(tmp_path: Path):
+    """Silence, or a traceback, would both read as "the bot is broken"."""
+    bot, _ = _pulse_bot(tmp_path, fetcher=None)
+    message = FakeMessage()
+    await bot.cmd_pulse(message, FakeCommand())  # type: ignore[arg-type]
+    assert "XAI_API_KEY" in message.last
+
+
+async def test_pulse_renders_a_digest(tmp_path: Path):
+    post = PulsePost(
+        text="something shipped",
+        author_handle="@karpathy",
+        url="https://x.com/karpathy/status/1",
+    )
+    bot, jobs = _pulse_bot(tmp_path, StubPulseFetcher([post]))
+    message = FakeMessage()
+
+    await jobs.start()
+    await bot.cmd_pulse(message, FakeCommand())  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    assert "something shipped" in message.replies[-1].final
+
+
+async def test_pulse_uses_the_default_topic_when_none_is_given(tmp_path: Path):
+    bot, jobs = _pulse_bot(tmp_path, StubPulseFetcher())
+    message = FakeMessage()
+
+    await jobs.start()
+    await bot.cmd_pulse(message, FakeCommand())  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    assert "AI" in message.replies[-1].final
+
+
+async def test_pulse_accepts_a_topic(tmp_path: Path):
+    bot, jobs = _pulse_bot(tmp_path, StubPulseFetcher())
+    message = FakeMessage()
+
+    await jobs.start()
+    await bot.cmd_pulse(message, FakeCommand("quantum computing"))  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    assert "quantum computing" in message.replies[-1].final
+
+
+async def test_pulse_refuses_when_the_budget_is_spent(tmp_path: Path):
+    """A digest is ~$0.63 — refusing before spending is the point of the guard."""
+
+    class SpentBudget:
+        def exceeded(self) -> bool:
+            return True
+
+        def spent_today(self) -> float:
+            return 2.0
+
+    jobs = JobQueue()
+    bot = VosBot(
+        journal=JsonlJournal(tmp_path / "journal"),
+        graph=FakeGraph(),  # type: ignore[arg-type]
+        pipeline=FakePipeline(_classification()),
+        jobs=jobs,
+        budget=SpentBudget(),  # type: ignore[arg-type]
+        pulse_fetcher=StubPulseFetcher(),
+    )
+    message = FakeMessage()
+    await bot.cmd_pulse(message, FakeCommand())  # type: ignore[arg-type]
+
+    assert "budget" in message.last.casefold()
