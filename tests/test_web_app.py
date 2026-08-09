@@ -1,16 +1,25 @@
-"""Web skeleton tests.
+"""Web app tests — no Telegram, no Neo4j, no microphone, no model.
 
-Two properties carry this story: the PIN gate actually gates (constant-time, header
-only, but `/api/health` stays open so the frontend can discover whether a PIN is
-needed at all), and a co-hosted uvicorn drains promptly when told to exit — the
-shell's `finally` gives it five seconds before moving on to stop the job queue.
+The capture endpoint re-states the §8.1 contract for a second transport, so the
+assertions mirror test_shell.py: journal write before anything else, a failed journal
+write reported as NOT saved, and everything after the fsync allowed to fail without
+losing the thought. On top of that, kiosk-specific properties: all graph writes go
+through the JobQueue (the FastAPI handler is genuinely concurrent with aiogram, so
+writing inline would break ADR-008), and a slow classification degrades to "pending"
+rather than holding the tablet's request open.
 """
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
+from test_shell import FakeGraph, FakePipeline, _classification
+
+from vos.contracts import kitchen_thought_id
+from vos.jobs import JobQueue
+from vos.journal import JsonlJournal
 
 httpx = pytest.importorskip("httpx")
 pytest.importorskip("fastapi")
@@ -18,8 +27,29 @@ pytest.importorskip("fastapi")
 from vos.web.app import KioskDeps, build_web_app, start_server  # noqa: E402
 
 
-def _deps(pin: str | None = None) -> KioskDeps:
-    return KioskDeps(
+class FakeTranscriber:
+    def __init__(self, text: str = "buy milk") -> None:
+        self.text = text
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def transcribe(self, audio: bytes, mime: str) -> str:
+        self.calls.append((audio, mime))
+        return self.text
+
+
+class FakeBudget:
+    def __init__(self, exceeded: bool = False) -> None:
+        self._exceeded = exceeded
+
+    def exceeded(self) -> bool:
+        return self._exceeded
+
+    def spent_today(self) -> float:
+        return 2.0 if self._exceeded else 0.0
+
+
+def _deps(pin: str | None = None, **overrides) -> KioskDeps:
+    defaults = dict(
         journal=None,
         graph=None,
         pipeline=None,
@@ -27,6 +57,14 @@ def _deps(pin: str | None = None) -> KioskDeps:
         transcriber=None,
         pin=pin,
     )
+    defaults.update(overrides)
+    return KioskDeps(**defaults)
+
+
+async def _started_jobs() -> JobQueue:
+    jobs = JobQueue(concurrency=1)
+    await jobs.start()
+    return jobs
 
 
 def _client(app) -> httpx.AsyncClient:
@@ -85,6 +123,236 @@ async def test_static_index_is_served_at_root():
         resp = await client.get("/")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
+
+
+# --- /api/transcribe ------------------------------------------------------ #
+
+
+async def test_transcribe_returns_the_transcript():
+    stt = FakeTranscriber("add oat milk to the list")
+    app = build_web_app(_deps(transcriber=stt))
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/transcribe",
+            files={"audio": ("clip.webm", b"opus-bytes", "audio/webm")},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"transcript": "add oat milk to the list"}
+    assert stt.calls == [(b"opus-bytes", "audio/webm")]
+
+
+async def test_transcribe_rejects_empty_audio():
+    app = build_web_app(_deps(transcriber=FakeTranscriber()))
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/transcribe", files={"audio": ("clip.webm", b"", "audio/webm")}
+        )
+    assert resp.status_code == 400
+
+
+async def test_transcribe_rejects_oversized_audio():
+    """A tap-to-talk clip is a few hundred KB; anything huge is a bug or abuse."""
+    app = build_web_app(_deps(transcriber=FakeTranscriber()))
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/transcribe",
+            files={"audio": ("clip.webm", b"x" * (11 * 1024 * 1024), "audio/webm")},
+        )
+    assert resp.status_code == 413
+
+
+# --- /api/capture: the §8.1 contract over HTTP ----------------------------- #
+
+
+def _capture_body(text: str = "buy milk", client_id: str = "c-1", **extra) -> dict:
+    return {"text": text, "client_id": client_id, **extra}
+
+
+async def test_capture_classifies_and_reports(tmp_path: Path):
+    journal = JsonlJournal(tmp_path / "journal")
+    graph = FakeGraph()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=graph,
+                pipeline=FakePipeline(_classification()),
+                jobs=jobs,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/capture",
+                json=_capture_body(source="voice", transcript="by milk"),
+            )
+    finally:
+        await jobs.stop()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["saved"] is True
+    assert body["status"] == "classified"
+    assert body["category"] == "TripPlanning"
+    assert body["title"] == "Tokyo flights"
+
+    (record,) = journal.records()
+    assert record.id == kitchen_thought_id("c-1")
+    assert record.channel == "kitchen"
+    assert record.source == "voice"
+    assert record.transcript == "by milk"
+    assert graph.thoughts[record.id]["status"] == "classified"
+
+
+async def test_capture_journal_failure_reports_not_saved(tmp_path: Path):
+    """A false 'captured' is the one outcome the design refuses — over any transport."""
+
+    class BrokenJournal:
+        async def append(self, entry) -> None:
+            raise OSError("disk full")
+
+    graph = FakeGraph()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(journal=BrokenJournal(), graph=graph, pipeline=FakePipeline(), jobs=jobs)
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+        assert resp.status_code == 503
+        assert resp.json()["saved"] is False
+        # Nothing may reach the graph for a thought that was never durable.
+        await jobs.drain()
+        assert graph.thoughts == {}
+    finally:
+        await jobs.stop()
+
+
+async def test_capture_graph_writes_go_through_the_job_queue(tmp_path: Path):
+    """ADR-008: the handler runs concurrently with aiogram handlers, so it must not
+    touch the graph itself. With no worker running, the graph must stay empty; the
+    moment the worker starts, the queued job projects the thought."""
+    journal = JsonlJournal(tmp_path / "journal")
+    graph = FakeGraph()
+    jobs = JobQueue(concurrency=1)  # deliberately NOT started yet
+    app = build_web_app(
+        _deps(
+            journal=journal,
+            graph=graph,
+            pipeline=FakePipeline(_classification()),
+            jobs=jobs,
+            classify_timeout_s=0.05,
+        )
+    )
+    async with _client(app) as client:
+        resp = await client.post("/api/capture", json=_capture_body())
+
+    assert resp.json()["status"] == "pending"  # timed out waiting, but saved
+    assert graph.thoughts == {}, "handler wrote the graph directly"
+    assert list(journal.records()), "journal write must not depend on the queue"
+
+    await jobs.start()
+    try:
+        await jobs.drain()
+    finally:
+        await jobs.stop()
+    assert graph.thoughts, "queued job never projected the thought"
+
+
+async def test_capture_slow_classification_degrades_to_pending(tmp_path: Path):
+    class SlowPipeline:
+        async def ainvoke(self, state) -> dict:
+            await asyncio.sleep(0.5)
+            return {"classification": _classification(), "error": None}
+
+    journal = JsonlJournal(tmp_path / "journal")
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=FakeGraph(),
+                pipeline=SlowPipeline(),
+                jobs=jobs,
+                classify_timeout_s=0.05,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+        body = resp.json()
+        assert body["saved"] is True
+        assert body["status"] == "pending"
+        await jobs.drain()  # the job still completes after the response went out
+    finally:
+        await jobs.stop()
+
+
+async def test_capture_budget_exceeded_defers_classification(tmp_path: Path):
+    """Capture always works; only enrichment costs money and only it is deferred."""
+    journal = JsonlJournal(tmp_path / "journal")
+    graph = FakeGraph()
+    pipeline = FakePipeline(_classification())
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=graph,
+                pipeline=pipeline,
+                jobs=jobs,
+                budget=FakeBudget(exceeded=True),
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body())
+    finally:
+        await jobs.stop()
+
+    body = resp.json()
+    assert body["saved"] is True
+    assert body["status"] == "unclassified"
+    assert "budget" in body["error"]
+    record_id = kitchen_thought_id("c-1")
+    assert graph.thoughts[record_id]["status"] == "unclassified"
+
+
+async def test_capture_retry_with_same_client_id_dedupes(tmp_path: Path):
+    journal = JsonlJournal(tmp_path / "journal")
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=FakeGraph(),
+                pipeline=FakePipeline(_classification()),
+                jobs=jobs,
+            )
+        )
+        async with _client(app) as client:
+            await client.post("/api/capture", json=_capture_body(client_id="c-9"))
+            await client.post("/api/capture", json=_capture_body(client_id="c-9"))
+    finally:
+        await jobs.stop()
+
+    assert len(journal.records()) == 1
+
+
+async def test_capture_rejects_blank_text(tmp_path: Path):
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(),
+                jobs=jobs,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post("/api/capture", json=_capture_body(text="   "))
+    finally:
+        await jobs.stop()
+    assert resp.status_code == 400
 
 
 # --- co-hosted server lifecycle ------------------------------------------- #
