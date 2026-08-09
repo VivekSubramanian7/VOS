@@ -64,7 +64,7 @@ your Tailscale tailnet — no public URL exists.
 
 ```bash
 uv sync --extra kiosk                                # whisper + fastapi + uvicorn
-tailscale serve --bg https / http://127.0.0.1:8765   # once, after installing Tailscale
+tailscale serve --bg http://127.0.0.1:8765   # once, after installing Tailscale
 # .env: VOS_KIOSK_ENABLED=1  (optional: VOS_KIOSK_PIN=…)
 ```
 

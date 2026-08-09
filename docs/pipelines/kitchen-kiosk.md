@@ -31,11 +31,13 @@ fallback is plain WireGuard + mkcert, at the cost of manual key and cert managem
 1. `uv sync --extra kiosk` — FastAPI, uvicorn and faster-whisper (~300 MB; the bundled
    PyAV decodes browser audio, no ffmpeg install needed).
 2. Install [Tailscale for Windows](https://tailscale.com/download), sign in (free
-   personal plan). In the admin console enable **MagicDNS** and **HTTPS certificates**.
-3. Publish the kiosk into the tailnet (persists across reboots):
+   personal plan). In the admin console enable **MagicDNS** and **HTTPS certificates**
+   (recent Tailscale versions prompt for these automatically on first `serve`).
+3. Publish the kiosk into the tailnet (persists across reboots; serves HTTPS on 443
+   with an auto-provisioned certificate by default):
 
    ```
-   tailscale serve --bg https / http://127.0.0.1:8765
+   tailscale serve --bg http://127.0.0.1:8765
    ```
 
 4. In `.env`:
