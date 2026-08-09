@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 _HANDLE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 _HOST = re.compile(r"^https?://(?:www\.)?(?:x|twitter)\.com/", re.IGNORECASE)
 _POST = re.compile(
-    r"^https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)",
+    r"^https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)(?:[/?]|$)",
     re.IGNORECASE,
 )
 

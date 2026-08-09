@@ -77,6 +77,34 @@ def test_non_post_urls_are_rejected(url: str):
     assert canonical_post_url(url) is None
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://x.com/karpathy/status/123abc456",
+        "https://x.com/karpathy/status/123abc",
+    ],
+)
+def test_trailing_garbage_after_the_status_id_is_rejected(url: str):
+    """A truncated match would rewrite a malformed id into a well-formed link that
+    points at a post which does not exist — exactly the failure this function
+    exists to prevent."""
+    assert canonical_post_url(url) is None
+
+
+def test_status_id_followed_by_a_trailing_slash_still_canonicalises():
+    assert (
+        canonical_post_url("https://x.com/karpathy/status/123/")
+        == "https://x.com/karpathy/status/123"
+    )
+
+
+def test_status_id_followed_by_a_query_string_still_canonicalises():
+    assert (
+        canonical_post_url("https://x.com/karpathy/status/123?s=20")
+        == "https://x.com/karpathy/status/123"
+    )
+
+
 # -- request building ------------------------------------------------------- #
 
 
