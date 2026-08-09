@@ -181,7 +181,28 @@ class FakeGraph:
         return len(notes)
 
     async def search_notes(self, term: str, n: int = 10):
-        return []
+        # State-aware like notes_for_video, so /notes has something real to find —
+        # otherwise a test asserting both groups of a search result is unwritable.
+        from uuid import uuid4
+
+        from vos.contracts import NoteView
+
+        matches = [
+            NoteView(
+                id=uuid4(),
+                text=note.text,
+                t_seconds=note.t_seconds,
+                section=note.section,
+                score=note.score,
+                video_id=video_id,
+                video_title="A Talk",
+                url=f"https://youtu.be/{video_id}",
+            )
+            for video_id, notes in self.notes.items()
+            for note in notes
+            if term in note.text
+        ]
+        return matches[:n]
 
     async def save_pulse(self, digest) -> int:
         self.pulses[str(digest.asked_at)] = digest
@@ -205,10 +226,36 @@ class FakeGraph:
         return video_id, self.video_added_at[video_id]
 
     async def posts_for_pulse(self, pulse):
+        from vos.contracts import pulse_id
+
+        for digest in self.pulses.values():
+            if pulse_id(digest.topic, digest.asked_at) == pulse:
+                return [self._post_view(p, digest) for p in digest.posts]
         return []
 
     async def search_posts(self, term: str, n: int = 10):
-        return []
+        matches = [
+            self._post_view(p, digest)
+            for digest in self.pulses.values()
+            for p in digest.posts
+            if term in p.text or term in p.author_handle
+        ]
+        return matches[:n]
+
+    @staticmethod
+    def _post_view(post, digest):
+        from vos.contracts import PostView, post_id
+
+        return PostView(
+            id=post_id(post.url),
+            text=post.text,
+            author_handle=post.author_handle,
+            url=post.url,
+            section=post.section,
+            score=post.score,
+            topic=digest.topic,
+            asked_at=digest.asked_at,
+        )
 
     async def notes_for_video(self, video_id: str):
         from uuid import uuid4
@@ -590,6 +637,33 @@ async def test_cmd_notes_requires_a_term(tmp_path: Path):
     assert "Usage" in m.last
 
 
+async def test_notes_returns_both_video_notes_and_x_posts(tmp_path: Path):
+    """Exercises cmd_notes's post path through the shell, not just render_search in
+    isolation — both groups must come back from one search."""
+    bot, jobs = _video_bot(tmp_path)
+    bot.pulse_fetcher = StubPulseFetcher(  # type: ignore[attr-defined]
+        [
+            PulsePost(
+                text="a new way to measure gravity",
+                author_handle="@karpathy",
+                url="https://x.com/karpathy/status/1",
+            )
+        ]
+    )
+    await jobs.start()
+    await bot.capture(FakeMessage("https://youtu.be/dQw4w9WgXcQ"))  # type: ignore[arg-type]
+    await bot.cmd_pulse(FakeMessage(), FakeCommand())  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    message = FakeMessage()
+    await bot.cmd_notes(message, FakeCommand("measure"))  # type: ignore[arg-type]
+    assert "cannot measure one way" in message.last
+    assert "a new way to measure gravity" in message.last
+    assert "From videos" in message.last
+    assert "From X" in message.last
+
+
 # --- parsing ----------------------------------------------------------------- #
 
 
@@ -661,6 +735,46 @@ async def test_more_rejects_something_that_is_not_a_video(tmp_path: Path):
     message = FakeMessage()
     await bot.cmd_more(message, FakeCommand("what did it say about pricing"))  # type: ignore[arg-type]
     assert "Usage" in message.last
+
+
+async def test_more_with_a_quiet_pulse_falls_through_to_the_video(tmp_path: Path):
+    """A pulse with zero posts still MERGEs a :Pulse node (it's the newest thing
+    looked at). Bare /more must not get stuck answering "no posts stored" forever —
+    it has to fall through to the video notes instead."""
+    bot, jobs = _video_bot(tmp_path)
+    await jobs.start()
+    await bot.capture(FakeMessage("https://youtu.be/dQw4w9WgXcQ"))  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    from vos.contracts import PulseDigest
+
+    await bot.graph.save_pulse(  # type: ignore[attr-defined]
+        PulseDigest(topic="AI", summary="Quiet day.", posts=[], asked_at=datetime.now(UTC))
+    )
+
+    message = FakeMessage()
+    await bot.cmd_more(message, FakeCommand())  # type: ignore[arg-type]
+    assert "cannot measure one way" in message.last
+
+
+async def test_more_after_a_pulse_renders_its_posts(tmp_path: Path):
+    """Exercises cmd_more's pulse branch end to end, not just the video one."""
+    post = PulsePost(
+        text="something shipped",
+        author_handle="@karpathy",
+        url="https://x.com/karpathy/status/1",
+    )
+    bot, jobs = _pulse_bot(tmp_path, StubPulseFetcher([post]))
+    await jobs.start()
+    await bot.cmd_pulse(FakeMessage(), FakeCommand())  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    message = FakeMessage()
+    await bot.cmd_more(message, FakeCommand())  # type: ignore[arg-type]
+    assert "something shipped" in message.last
+    assert "@karpathy" in message.last
 
 
 @pytest.mark.parametrize("raw", ["", "person", "wizard Gandalf", "   "])
@@ -796,6 +910,27 @@ async def test_pulse_accepts_a_topic(tmp_path: Path):
     await jobs.stop()
 
     assert "quantum computing" in message.replies[-1].final
+
+
+async def test_pulse_topic_is_escaped_in_the_placeholder(tmp_path: Path):
+    """`/pulse <b>foo` must produce a reply, not silence.
+
+    The placeholder is sent with parse_mode=HTML; an unescaped topic would make the
+    call raise, and because it happens before the `try:` in the job, `JobQueue._run`
+    would swallow it — the user would see nothing at all.
+    """
+    bot, jobs = _pulse_bot(tmp_path, StubPulseFetcher())
+    message = FakeMessage()
+
+    await jobs.start()
+    await bot.cmd_pulse(message, FakeCommand("<b>foo"))  # type: ignore[arg-type]
+    await jobs.drain()
+    await jobs.stop()
+
+    assert message.replies  # a reply exists at all — not silence
+    placeholder = message.replies[0].text or ""
+    assert "<b>foo" not in placeholder
+    assert "&lt;b&gt;foo" in placeholder
 
 
 async def test_pulse_refuses_when_the_budget_is_spent(tmp_path: Path):

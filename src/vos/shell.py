@@ -19,6 +19,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from html import escape
 from typing import Any
 from uuid import UUID
 
@@ -258,7 +259,7 @@ class VosBot:
         topic = (command.args or "").strip() or self.pulse_topic
 
         async def job() -> None:
-            note = await message.answer(f"🐦 Reading X for “{topic}”…")
+            note = await message.answer(f"🐦 Reading X for “{escape(topic)}”…")
             try:
                 result = await run_pulse(
                     self.pulse_fetcher, self.graph, topic, cassette=self.cassette
@@ -294,8 +295,12 @@ class VosBot:
             video = await self.graph.latest_video()
             if pulse and (video is None or pulse[1] >= video[1]):
                 posts = await self.graph.posts_for_pulse(pulse[0])
-                await _send(message.answer, render_all_posts(posts))
-                return
+                if posts:
+                    await _send(message.answer, render_all_posts(posts))
+                    return
+                # A quiet day still MERGEs a :Pulse node with zero posts. Without this
+                # fallback, that empty pulse would permanently block bare /more from
+                # ever reaching the video notes again.
             if video is None:
                 await message.answer("Nothing processed yet.")
                 return
