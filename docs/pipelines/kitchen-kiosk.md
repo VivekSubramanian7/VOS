@@ -75,6 +75,11 @@ through `tailscale serve`. Do not open firewall ports for it; none are needed.
   list, and the reply names them. The kiosk is an *add-only* door to that list:
   ticking items off stays on Telegram (`/shopping` buttons, `/bought`), where the
   tap-to-buy keyboard lives.
+- **Shopping** tab: a grid of cards for the household staples. Tapping one puts it
+  on the list — no model call, no typing — and the card disappears while the item
+  is pending. It reappears once the item is marked bought on Telegram (checked on
+  tab open and every 45 s). Editing the staples is a one-line change to
+  `CARD_ITEMS` in `src/vos/web/static/app.js`.
 - **Ask** mode: same flow, but the confirmed text goes to the chat agent, which can
   search thoughts, video notes and X posts (read-only) or just answer generally.
 - A capture that cannot be classified right now (budget, provider down) is still

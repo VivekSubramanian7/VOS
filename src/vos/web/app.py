@@ -26,7 +26,13 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from vos.contracts import CaptureRecord, InputSource
+from vos.contracts import (
+    CaptureRecord,
+    Classification,
+    ExtractedEntity,
+    InputSource,
+    ShoppingItem,
+)
 from vos.projection import classify_one, process_shopping
 
 log = logging.getLogger(__name__)
@@ -70,6 +76,23 @@ class CaptureRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+
+
+class ShoppingAddRequest(BaseModel):
+    name: str
+    client_id: str
+
+
+def _card_classification(name: str) -> Classification:
+    """A tapped card names a known grocery item — spending a model call to discover
+    it is Shopping would be paying to be told what the button already says."""
+    return Classification(
+        category="Shopping",
+        title=name,
+        summary=f"{name} — added from the kitchen shopping tab.",
+        entities=[ExtractedEntity(name=name, type="product", salience=0.9)],
+        confidence=1.0,
+    )
 
 
 def build_web_app(deps: KioskDeps) -> FastAPI:
@@ -215,6 +238,62 @@ def build_web_app(deps: KioskDeps) -> FastAPI:
             # and sits in /pending; the tablet is told exactly that.
             return {"saved": True, "id": str(record.id), "status": "pending"}
         return {"saved": True, "id": str(record.id), **outcome}
+
+    @app.get("/api/shopping")
+    async def shopping_pending() -> dict:
+        """Canonical names of everything currently pending on the list. The tab uses
+        this to decide which cards to hide — a hidden card *is* a pending item."""
+        if deps.shopping is None:
+            raise HTTPException(status_code=503, detail="shopping is not enabled")
+        items = await deps.shopping.pending_items()
+        return {"pending": [i.canonical_name for i in items]}
+
+    @app.post("/api/shopping/add")
+    async def shopping_add(req: ShoppingAddRequest) -> Any:
+        """One tapped card → one journal capture → one list item. No model calls:
+        the classification is preset (the card names a known item) and the item goes
+        onto the store directly, skipping extraction. Same durability contract as
+        /api/capture — journal first, graph and store via the single worker."""
+        if deps.shopping is None:
+            raise HTTPException(status_code=503, detail="shopping is not enabled")
+        name = req.name.strip()
+        if not name or len(name) > 80:
+            raise HTTPException(status_code=400, detail="bad item name")
+
+        record = CaptureRecord.create_kitchen(
+            client_id=req.client_id,
+            text=name,
+            captured_at=datetime.now(UTC),
+            source="text",
+        )
+        try:
+            await deps.journal.append(record)
+        except OSError as exc:
+            log.exception("Journal write failed for shopping card %s", record.id)
+            return JSONResponse(
+                {"saved": False, "detail": type(exc).__name__}, status_code=503
+            )
+
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def project() -> None:
+            try:
+                await deps.graph.upsert_thought(record, _card_classification(name))
+                await deps.shopping.add(
+                    record.id, [ShoppingItem(name=name)], record.captured_at
+                )
+                await deps.shopping.record_extraction(record.id)
+            except Exception:  # noqa: BLE001 — the capture is already durable
+                log.exception("Shopping card projection failed for %s", record.id)
+            if not fut.done():
+                fut.set_result(None)
+
+        await deps.jobs.submit(f"kitchen-card:{record.id}", project)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(fut, timeout=5.0)
+
+        items = await deps.shopping.pending_items()
+        return {"saved": True, "pending": [i.canonical_name for i in items]}
 
     @app.post("/api/chat")
     async def chat(req: ChatRequest) -> dict:

@@ -369,6 +369,22 @@ class FakeShoppingStore:
     async def record_extraction(self, thought_id, error=None) -> None:
         self.extractions.append((thought_id, error))
 
+    async def pending_items(self):
+        from datetime import UTC, datetime
+
+        from vos.contracts import ItemView, canonical
+
+        return [
+            ItemView(
+                id=i,
+                name=item.name,
+                canonical_name=canonical(item.name),
+                added_at=datetime.now(UTC),
+            )
+            for i, (_tid, items) in enumerate(self.added, start=1)
+            for item in items
+        ]
+
 
 class FakeShoppingPipeline:
     def __init__(self, names: list[str] | None = None, error: str | None = None) -> None:
@@ -499,6 +515,121 @@ async def test_shopping_extraction_skipped_when_kiosk_lacks_the_store(tmp_path: 
     finally:
         await jobs.stop()
     assert resp.json()["status"] == "classified"
+
+
+# --- /api/shopping: the card tab -------------------------------------------- #
+
+
+async def test_card_tap_adds_without_any_model_call(tmp_path: Path):
+    """A tapped card is a known item: journal capture + preset classification +
+    direct store add. Neither the classifier nor the extractor may be invoked."""
+    store = FakeShoppingStore()
+    classifier = FakePipeline(_classification())
+    extractor = FakeShoppingPipeline(["should not run"])
+    journal = JsonlJournal(tmp_path / "journal")
+    graph = FakeGraph()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=graph,
+                pipeline=classifier,
+                jobs=jobs,
+                shopping=store,
+                shopping_pipeline=extractor,
+            )
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/shopping/add", json={"name": "oat milk", "client_id": "card-1"}
+            )
+    finally:
+        await jobs.stop()
+
+    body = resp.json()
+    assert body["saved"] is True
+    assert "oat milk" in body["pending"]
+    assert extractor.calls == 0
+
+    (record,) = journal.records()
+    assert record.text == "oat milk"
+    assert record.channel == "kitchen"
+    entry = graph.thoughts[record.id]
+    assert entry["classification"].category == "Shopping"
+    (added,) = store.added
+    assert [i.name for i in added[1]] == ["oat milk"]
+    assert store.extractions[-1] == (record.id, None)
+
+
+async def test_card_tap_retry_dedupes_in_the_journal(tmp_path: Path):
+    journal = JsonlJournal(tmp_path / "journal")
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=journal,
+                graph=FakeGraph(),
+                pipeline=FakePipeline(),
+                jobs=jobs,
+                shopping=FakeShoppingStore(),
+            )
+        )
+        async with _client(app) as client:
+            await client.post(
+                "/api/shopping/add", json={"name": "rice", "client_id": "card-2"}
+            )
+            await client.post(
+                "/api/shopping/add", json={"name": "rice", "client_id": "card-2"}
+            )
+    finally:
+        await jobs.stop()
+    assert len(journal.records()) == 1
+
+
+async def test_shopping_pending_lists_canonical_names(tmp_path: Path):
+    store = FakeShoppingStore()
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(),
+                jobs=jobs,
+                shopping=store,
+            )
+        )
+        async with _client(app) as client:
+            await client.post(
+                "/api/shopping/add", json={"name": "  Kitchen  Tissue ", "client_id": "c1"}
+            )
+            resp = await client.get("/api/shopping")
+    finally:
+        await jobs.stop()
+    assert resp.json() == {"pending": ["kitchen tissue"]}
+
+
+async def test_shopping_endpoints_503_without_the_store(tmp_path: Path):
+    jobs = await _started_jobs()
+    try:
+        app = build_web_app(
+            _deps(
+                journal=JsonlJournal(tmp_path / "journal"),
+                graph=FakeGraph(),
+                pipeline=FakePipeline(),
+                jobs=jobs,
+            )
+        )
+        async with _client(app) as client:
+            get_resp = await client.get("/api/shopping")
+            add_resp = await client.post(
+                "/api/shopping/add", json={"name": "rice", "client_id": "c1"}
+            )
+    finally:
+        await jobs.stop()
+    assert get_resp.status_code == 503
+    assert add_resp.status_code == 503
 
 
 # --- /api/chat -------------------------------------------------------------- #

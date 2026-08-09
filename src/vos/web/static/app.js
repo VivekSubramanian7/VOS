@@ -25,10 +25,27 @@ const sessionId =
     return v;
   })();
 
-let mode = "capture"; // "capture" | "ask"
+let mode = "capture"; // "capture" | "ask" | "shopping"
 let recorder = null;
 let chunks = [];
 let pendingTranscript = null; // raw whisper text while the confirm card is open
+
+/* The staples. A hidden card IS a pending list item; it reappears once the item
+   is marked bought (on Telegram). Order: fruit, drinks, staples, household, fresh. */
+const CARD_ITEMS = [
+  ["🍌", "Banana"], ["🍇", "Grapes"], ["🍓", "Strawberry"], ["🥝", "Kiwi"],
+  ["🍑", "Peaches"], ["🍎", "Apple"], ["🍊", "Orange"],
+  ["🥛", "Oat milk"], ["🧃", "Juice"], ["💧", "Sprudel"],
+  ["🍚", "Rice"], ["🧻", "Kitchen tissue"], ["🚽", "Toilet paper"],
+  ["🧼", "Soap"], ["🧴", "Kitchen soap"], ["🫧", "Dishwasher pills"],
+  ["🥔", "Potato"], ["🍗", "Chicken"], ["🐟", "Fish"],
+  ["🥕", "Carrot"], ["🥬", "Spinach"], ["🍅", "Tomato"], ["🥚", "Egg"],
+];
+
+let pendingSet = new Set(); // canonical names currently on the list
+let shoppingTimer = null;
+
+const canon = (name) => name.trim().toLowerCase().replace(/\s+/g, " ");
 
 /* --- helpers -------------------------------------------------------------- */
 
@@ -68,13 +85,86 @@ function bubble(text, who, extra = {}) {
 
 function setMode(next) {
   mode = next;
-  $("mode-capture").classList.toggle("is-active", next === "capture");
-  $("mode-ask").classList.toggle("is-active", next === "ask");
-  $("mode-capture").setAttribute("aria-selected", String(next === "capture"));
-  $("mode-ask").setAttribute("aria-selected", String(next === "ask"));
+  for (const m of ["capture", "ask", "shopping"]) {
+    $(`mode-${m}`).classList.toggle("is-active", next === m);
+    $(`mode-${m}`).setAttribute("aria-selected", String(next === m));
+  }
+
+  const shopping = next === "shopping";
+  $("cards").classList.toggle("hidden", !shopping);
+  feed.classList.toggle("hidden", shopping);
+  document.querySelector(".dock").classList.toggle("hidden", shopping);
+  if (shopping) {
+    closeConfirm();
+    refreshShopping();
+    // The tablet sits on this tab; bought items must reappear without a touch.
+    shoppingTimer = shoppingTimer || setInterval(refreshShopping, 45000);
+  } else if (shoppingTimer) {
+    clearInterval(shoppingTimer);
+    shoppingTimer = null;
+  }
+
   $("confirm-send").textContent = next === "capture" ? "Save it" : "Ask";
   typeInput.placeholder =
     next === "capture" ? "…or type a thought to save" : "…or type a question";
+}
+
+/* --- shopping cards --------------------------------------------------------- */
+
+function renderCards() {
+  const grid = $("cards-grid");
+  grid.textContent = "";
+  for (const [emoji, name] of CARD_ITEMS) {
+    const btn = document.createElement("button");
+    btn.className = "card";
+    btn.dataset.name = name;
+    if (pendingSet.has(canon(name))) btn.classList.add("is-gone");
+    const glyph = document.createElement("span");
+    glyph.className = "card-emoji";
+    glyph.textContent = emoji;
+    const label = document.createElement("span");
+    label.className = "card-label";
+    label.textContent = name;
+    btn.append(glyph, label);
+    btn.addEventListener("click", () => addCard(btn, name));
+    grid.appendChild(btn);
+  }
+}
+
+function applyPending(names) {
+  pendingSet = new Set(names.map(canon));
+  for (const btn of document.querySelectorAll(".card")) {
+    btn.classList.toggle("is-gone", pendingSet.has(canon(btn.dataset.name)));
+  }
+}
+
+async function refreshShopping() {
+  try {
+    const resp = await api("/api/shopping");
+    if (!resp.ok) return;
+    const { pending } = await resp.json();
+    applyPending(pending);
+  } catch {
+    /* transient — the next refresh catches up */
+  }
+}
+
+async function addCard(btn, name) {
+  btn.classList.add("is-vanishing"); // optimistic; confirmed or reverted below
+  try {
+    const resp = await api("/api/shopping/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, client_id: crypto.randomUUID() }),
+    });
+    const body = await resp.json();
+    if (!resp.ok || body.saved === false) throw new Error("save failed");
+    applyPending(body.pending);
+  } catch (err) {
+    if (err.message !== "pin") btn.classList.remove("is-gone");
+  } finally {
+    btn.classList.remove("is-vanishing");
+  }
 }
 
 /* --- recording -------------------------------------------------------------- */
@@ -268,6 +358,7 @@ $("type-form").addEventListener("submit", (e) => {
 
 $("mode-capture").addEventListener("click", () => setMode("capture"));
 $("mode-ask").addEventListener("click", () => setMode("ask"));
+$("mode-shopping").addEventListener("click", () => setMode("shopping"));
 
 $("pin-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -285,6 +376,7 @@ $("pin-form").addEventListener("submit", async (e) => {
   }
 });
 
+renderCards();
 setMode("capture");
 checkHealth();
 bubble(

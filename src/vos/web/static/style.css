@@ -131,6 +131,53 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 .bubble.is-thinking { color: var(--cream-dim); font-style: italic; }
 
+/* --- shopping cards --------------------------------------------------------- */
+
+.cards {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.25rem 1.25rem 1.25rem;
+}
+
+.cards-hint {
+  color: var(--cream-dim);
+  font-size: 0.95rem;
+  margin: 0.25rem 0 0.9rem;
+}
+
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+  gap: 0.7rem;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.9rem 0.5rem 0.8rem;
+  border: 0;
+  border-radius: 0.9rem;
+  background: var(--bubble-bot);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.card:active { background: var(--bubble-user); }
+
+.card-emoji { font-size: 2.1rem; line-height: 1; }
+
+.card-label { font-size: 1rem; color: var(--cream); }
+
+.card.is-vanishing { opacity: 0.25; transform: scale(0.92); }
+
+/* A hidden card IS a pending list item — it returns when the item is bought. */
+.card.is-gone { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card { transition: none; }
+}
+
 /* --- transcript confirmation ---------------------------------------------- */
 
 .confirm {

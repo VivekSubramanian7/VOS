@@ -75,7 +75,9 @@ itself lives in `shopping.db`, which is disposable — see
 
 A tablet in the kitchen can talk to VOS: the daemon serves a web page where anyone in
 the family speaks a thought, corrects the locally-transcribed text, and saves it —
-or asks questions over the graph in chat. Audio never leaves the machine
+or asks questions over the graph in chat. A Shopping tab shows tap-to-add cards for
+the household staples; a tapped card lands on the shared list (no model call) and the
+card hides until the item is marked bought on Telegram. Audio never leaves the machine
 (faster-whisper runs on it), chat is ephemeral, and the page is reachable only inside
 your Tailscale tailnet — no public URL exists.
 
