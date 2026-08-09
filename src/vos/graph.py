@@ -22,6 +22,8 @@ from vos.contracts import (
     Classification,
     GraphStats,
     NoteView,
+    PostView,
+    PulseDigest,
     SourceRef,
     Status,
     ThoughtView,
@@ -29,6 +31,8 @@ from vos.contracts import (
     VideoNote,
     canonical,
     note_id,
+    post_id,
+    pulse_id,
 )
 
 log = logging.getLogger(__name__)
@@ -49,6 +53,9 @@ SCHEMA: tuple[str, ...] = (
     "CREATE CONSTRAINT video_id IF NOT EXISTS FOR (v:Video) REQUIRE v.id IS UNIQUE",
     "CREATE CONSTRAINT note_id IF NOT EXISTS FOR (n:Note) REQUIRE n.id IS UNIQUE",
     "CREATE FULLTEXT INDEX note_text IF NOT EXISTS FOR (n:Note) ON EACH [n.text]",
+    "CREATE CONSTRAINT pulse_id IF NOT EXISTS FOR (p:Pulse) REQUIRE p.id IS UNIQUE",
+    "CREATE CONSTRAINT post_id IF NOT EXISTS FOR (p:Post) REQUIRE p.id IS UNIQUE",
+    "CREATE FULLTEXT INDEX post_text IF NOT EXISTS FOR (p:Post) ON EACH [p.text]",
 )
 
 
@@ -81,6 +88,19 @@ def _to_note(row: dict[str, Any]) -> NoteView:
         # Notes written before scoring existed have no value signal; 0.5 keeps them
         # mid-pack rather than pretending they were judged.
         score=float(row.get("score") if row.get("score") is not None else 0.5),
+    )
+
+
+def _to_post(row: dict[str, Any]) -> PostView:
+    return PostView(
+        id=UUID(row["id"]),
+        text=row["text"],
+        author_handle=row["handle"],
+        url=row["url"],
+        section=row.get("section"),
+        score=float(row.get("score") if row.get("score") is not None else 0.5),
+        topic=row.get("topic") or "",
+        asked_at=_native(row["asked_at"]),
     )
 
 
@@ -582,6 +602,108 @@ class Neo4jGraph:
             n=n,
         )
         return [_to_note(r) for r in rows]
+
+    # -- pulse ---------------------------------------------------------- #
+
+    async def save_pulse(self, digest: PulseDigest) -> int:
+        """Project one digest. Returns how many posts were written.
+
+        MERGE rather than replace, unlike `replace_notes`. Re-distilling a video
+        supersedes that video's own earlier output, so replacing is right there. A
+        post recurring across digests is the *same post* — it keeps one identity and
+        gains a second `HAS_POST` edge.
+        """
+        pid = str(pulse_id(digest.topic, digest.asked_at))
+        await self._run(
+            """
+            MERGE (p:Pulse {id: $pid})
+            SET p.topic = $topic, p.summary = $summary,
+                p.asked_at = datetime($asked_at)
+            """,
+            pid=pid,
+            topic=digest.topic,
+            summary=digest.summary,
+            asked_at=digest.asked_at.isoformat(),
+        )
+        if not digest.posts:
+            return 0
+
+        payload = [
+            {
+                "id": str(post_id(p.url)),
+                "text": p.text,
+                "url": p.url,
+                "handle": p.author_handle,
+                "section": p.section,
+                "score": p.score,
+            }
+            for p in digest.posts
+        ]
+        await self._run(
+            """
+            MATCH (p:Pulse {id: $pid})
+            UNWIND $posts AS post
+            MERGE (n:Post {id: post.id})
+              ON CREATE SET n.first_seen = datetime()
+            SET n.text = post.text, n.url = post.url,
+                n.author_handle = post.handle,
+                n.section = post.section, n.score = post.score
+            MERGE (p)-[:HAS_POST]->(n)
+            WITH n, post
+            OPTIONAL MATCH (s:Entity:Source {canonical_name: post.handle})
+            FOREACH (_ IN CASE WHEN s IS NULL THEN [] ELSE [1] END |
+                MERGE (n)-[:BY]->(s))
+            """,
+            pid=pid,
+            posts=payload,
+        )
+        return len(payload)
+
+    _POST_VIEW = """
+        RETURN n.id AS id, n.text AS text, n.url AS url,
+               n.author_handle AS handle, n.section AS section, n.score AS score,
+               p.topic AS topic, p.asked_at AS asked_at
+    """
+
+    async def posts_for_pulse(self, pulse: UUID) -> list[PostView]:
+        rows = await self._run(
+            f"""
+            MATCH (p:Pulse {{id: $pid}})-[:HAS_POST]->(n:Post)
+            {self._POST_VIEW}
+            ORDER BY score DESC
+            """,
+            pid=str(pulse),
+        )
+        return [_to_post(r) for r in rows]
+
+    async def search_posts(self, term: str, n: int = 10) -> list[PostView]:
+        rows = await self._run(
+            f"""
+            CALL db.index.fulltext.queryNodes('post_text', $term) YIELD node AS n
+            MATCH (p:Pulse)-[:HAS_POST]->(n)
+            {self._POST_VIEW}
+            LIMIT $n
+            """,
+            term=term,
+            n=n,
+        )
+        return [_to_post(r) for r in rows]
+
+    async def latest_pulse(self) -> tuple[UUID, datetime] | None:
+        rows = await self._run(
+            "MATCH (p:Pulse) RETURN p.id AS id, p.asked_at AS at "
+            "ORDER BY p.asked_at DESC LIMIT 1"
+        )
+        return (UUID(rows[0]["id"]), _native(rows[0]["at"])) if rows else None
+
+    async def latest_video(self) -> tuple[str, datetime] | None:
+        """The newest video and when it was fetched, so `/more` can decide between a
+        recent pulse and a recent video without holding session state."""
+        rows = await self._run(
+            "MATCH (v:Video) RETURN v.id AS id, v.fetched_at AS at "
+            "ORDER BY v.fetched_at DESC LIMIT 1"
+        )
+        return (rows[0]["id"], _native(rows[0]["at"])) if rows else None
 
     async def mark_video_failed(self, thought_id: UUID, reason: str, permanent: bool) -> None:
         """Record why a video could not be processed.

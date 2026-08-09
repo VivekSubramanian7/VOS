@@ -16,9 +16,12 @@ from vos.contracts import (
     CaptureRecord,
     Classification,
     ExtractedEntity,
+    PulseDigest,
+    PulsePost,
     SourceRef,
     VideoMeta,
     VideoNote,
+    pulse_id,
 )
 from vos.graph import Neo4jGraph
 
@@ -518,3 +521,109 @@ async def test_wipe_clears_everything(graph: Neo4jGraph):
     await graph.wipe()
     assert (await graph.stats()).total == 0
     assert await graph.following() == []
+
+
+# --- x pulse ------------------------------------------------------------------ #
+
+
+def _digest(*posts: PulsePost, topic: str = "AI", at=None) -> PulseDigest:
+    from datetime import UTC, datetime
+
+    return PulseDigest(
+        topic=topic,
+        summary="A summary.",
+        posts=list(posts),
+        asked_at=at or datetime(2026, 8, 9, 12, 0, tzinfo=UTC),
+    )
+
+
+def _post(text: str = "a claim", handle: str = "@karpathy", n: int = 1, **kw):
+    return PulsePost(
+        text=text,
+        author_handle=handle,
+        url=f"https://x.com/{handle.lstrip('@')}/status/{n}",
+        **kw,
+    )
+
+
+@pytest.mark.integration
+async def test_pulse_and_posts_round_trip(graph):
+    digest = _digest(_post(section="Releases", score=0.9))
+    count = await graph.save_pulse(digest)
+    assert count == 1
+
+    posts = await graph.posts_for_pulse(pulse_id(digest.topic, digest.asked_at))
+    assert [p.text for p in posts] == ["a claim"]
+    assert posts[0].section == "Releases"
+    assert posts[0].score == 0.9
+    assert posts[0].topic == "AI"
+
+
+@pytest.mark.integration
+async def test_the_same_post_in_two_digests_stays_one_node(graph):
+    """Otherwise a story running for a week appears seven times in /more."""
+    from datetime import UTC, datetime
+
+    shared = _post(n=42)
+    await graph.save_pulse(_digest(shared, at=datetime(2026, 8, 9, tzinfo=UTC)))
+    await graph.save_pulse(_digest(shared, at=datetime(2026, 8, 10, tzinfo=UTC)))
+
+    rows = await graph._run("MATCH (n:Post) RETURN count(n) AS c")
+    assert rows[0]["c"] == 1
+
+
+@pytest.mark.integration
+async def test_posts_link_to_a_followed_source(graph):
+    await graph.follow(SourceRef(name="@karpathy", kind="x"))
+    await graph.save_pulse(_digest(_post(handle="@karpathy")))
+
+    rows = await graph._run(
+        "MATCH (:Post)-[:BY]->(s:Entity:Source) RETURN s.name AS name"
+    )
+    assert [r["name"] for r in rows] == ["@karpathy"]
+
+
+@pytest.mark.integration
+async def test_posts_from_unfollowed_accounts_have_no_source_edge(graph):
+    await graph.save_pulse(_digest(_post(handle="@stranger")))
+    rows = await graph._run("MATCH (:Post)-[:BY]->() RETURN count(*) AS c")
+    assert rows[0]["c"] == 0
+
+
+@pytest.mark.integration
+async def test_search_posts_finds_a_post(graph):
+    await graph.save_pulse(_digest(_post(text="transformers got faster")))
+    found = await graph.search_posts("transformers")
+    assert [p.text for p in found] == ["transformers got faster"]
+
+
+@pytest.mark.integration
+async def test_search_notes_does_not_return_posts(graph):
+    """The whole reason posts got their own label — see the spec's correction 2."""
+    await graph.save_pulse(_digest(_post(text="transformers got faster")))
+    assert await graph.search_notes("transformers") == []
+
+
+@pytest.mark.integration
+async def test_latest_pulse_is_the_most_recent(graph):
+    from datetime import UTC, datetime
+
+    old = datetime(2026, 8, 1, tzinfo=UTC)
+    new = datetime(2026, 8, 9, tzinfo=UTC)
+    await graph.save_pulse(_digest(_post(n=1), at=old))
+    await graph.save_pulse(_digest(_post(n=2), at=new))
+
+    latest = await graph.latest_pulse()
+    assert latest is not None
+    assert latest[0] == pulse_id("AI", new)
+
+
+@pytest.mark.integration
+async def test_latest_pulse_is_none_on_an_empty_graph(graph):
+    assert await graph.latest_pulse() is None
+
+
+@pytest.mark.integration
+async def test_saving_a_digest_with_no_posts_is_fine(graph):
+    """A quiet day still records that we asked."""
+    assert await graph.save_pulse(_digest()) == 0
