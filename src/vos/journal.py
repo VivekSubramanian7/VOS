@@ -29,11 +29,20 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
-from vos.contracts import CaptureRecord, JournalEntry, Tombstone
+from vos.contracts import CaptureRecord, ItemMark, JournalEntry, Tombstone
 
 log = logging.getLogger(__name__)
 
 _entry_adapter: TypeAdapter[JournalEntry] = TypeAdapter(JournalEntry)
+
+
+def _stamped_at(entry: JournalEntry) -> datetime:
+    """Which timestamp decides the month file. Each kind carries its own."""
+    if isinstance(entry, CaptureRecord):
+        return entry.captured_at
+    if isinstance(entry, Tombstone):
+        return entry.deleted_at
+    return entry.at
 
 
 class JsonlJournal:
@@ -65,7 +74,7 @@ class JsonlJournal:
         Callers must let that propagate: failing to ack is correct, silently
         continuing is not.
         """
-        when = entry.captured_at if isinstance(entry, CaptureRecord) else entry.deleted_at
+        when = _stamped_at(entry)
         line = entry.model_dump_json()
         async with self._lock:
             await asyncio.to_thread(self._append_sync, self._path_for(when), line)
@@ -122,10 +131,19 @@ class JsonlJournal:
         for entry in self.read_all():
             if isinstance(entry, Tombstone):
                 alive.pop(entry.id, None)
-            else:
+            elif isinstance(entry, CaptureRecord):
                 alive[entry.id] = entry
         return sorted(alive.values(), key=lambda r: r.captured_at)
 
     def last_capture(self) -> CaptureRecord | None:
         records = self.records()
         return records[-1] if records else None
+
+    def item_marks(self) -> list[ItemMark]:
+        """Shopping ticks in write order.
+
+        Replayed on every startup and after a rebuild, which is what makes a bought
+        item stay bought across both. Unlike `records()` there is no dedup here: each
+        mark is an event, and the store decides which one wins by comparing timestamps.
+        """
+        return [e for e in self.read_all() if isinstance(e, ItemMark)]

@@ -463,3 +463,118 @@ def test_search_omits_a_group_that_found_nothing():
 
 def test_search_with_no_results_at_all():
     assert "No" in render_search([], [], "term")
+
+
+# --- shopping -------------------------------------------------------------- #
+
+
+def _item(n: int, name: str, quantity: str | None = None, note: str | None = None):
+    from vos.contracts import ItemView, canonical
+
+    return ItemView(
+        id=n,
+        name=name,
+        canonical_name=canonical(name),
+        quantity=quantity,
+        note=note,
+        added_at=datetime(2026, 8, 9, tzinfo=UTC),
+    )
+
+
+def test_shopping_list_is_numbered():
+    """The numbers are an interface: `/bought 2` has to mean the second row."""
+    from vos.render import render_shopping_list
+
+    out = render_shopping_list([_item(1, "bananas"), _item(2, "oat milk")])
+
+    assert "1. bananas" in out
+    assert "2. oat milk" in out
+
+
+def test_shopping_list_shows_quantity_and_qualifier():
+    from vos.render import render_shopping_list
+
+    out = render_shopping_list([_item(1, "oat milk", "2L", "the barista one")])
+
+    assert "2L" in out and "barista" in out
+
+
+def test_a_plain_item_stays_plain():
+    from vos.render import render_shopping_list
+
+    assert "·" not in render_shopping_list([_item(1, "bananas")])
+
+
+def test_an_empty_shopping_list_explains_how_to_fill_it():
+    from vos.render import render_shopping_list
+
+    out = render_shopping_list([])
+
+    assert "Nothing on it" in out
+    assert "oat milk" in out, "an empty state should show what to do next"
+
+
+def test_the_bought_tail_appears_only_when_something_is_bought():
+    from vos.render import render_shopping_list
+
+    assert "already bought" not in render_shopping_list([_item(1, "bananas")])
+    assert "3 already bought" in render_shopping_list([_item(1, "bananas")], bought=3)
+
+
+def test_item_names_are_escaped():
+    """Item names are arbitrary user text echoed back; an unescaped `<` breaks the
+    message rather than displaying."""
+    from vos.render import render_shopping_list
+
+    out = render_shopping_list([_item(1, "<b>bananas</b>", "<2L", "a & b")])
+
+    assert "&lt;b&gt;bananas" in out
+    assert "&lt;2L" in out
+    assert "a &amp; b" in out
+
+
+def test_shopping_update_lists_what_was_added():
+    from vos.contracts import ShoppingItem, ShoppingResult
+    from vos.render import render_shopping_update
+
+    result = ShoppingResult(
+        thought_id=uuid4(),
+        items=[ShoppingItem(name="bananas"), ShoppingItem(name="oat milk", quantity="2L")],
+    )
+    out = render_shopping_update(result)
+
+    assert "bananas" in out and "2L" in out
+    assert "/shopping" in out
+
+
+def test_shopping_update_is_honest_about_adding_nothing():
+    """A Shopping thought with nothing to buy is indistinguishable, from outside, from
+    one the bot silently dropped."""
+    from vos.contracts import ShoppingResult
+    from vos.render import render_shopping_update
+
+    out = render_shopping_update(ShoppingResult(thought_id=uuid4(), items=[]))
+
+    assert "Nothing to add" in out
+
+
+def test_shopping_update_reports_a_failure_and_reassures():
+    from vos.contracts import ShoppingResult
+    from vos.render import render_shopping_update
+
+    out = render_shopping_update(
+        ShoppingResult(thought_id=uuid4(), error="provider is down")
+    )
+
+    assert "provider is down" in out
+    assert "saved" in out, "the thought itself survived; say so"
+
+
+def test_a_long_shopping_list_still_splits():
+    from vos.render import render_shopping_list, split_message
+
+    items = [_item(n, f"item number {n} with a fairly long name") for n in range(1, 200)]
+    chunks = split_message(render_shopping_list(items))
+
+    assert len(chunks) > 1
+    assert all(len(c) <= 4000 for c in chunks)

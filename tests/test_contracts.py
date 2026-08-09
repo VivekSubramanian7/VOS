@@ -9,17 +9,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from vos.contracts import (
     CATEGORIES,
     CaptureRecord,
     Classification,
     ExtractedEntity,
+    ItemMark,
+    JournalEntry,
     PostView,
     PulseDigest,
     PulsePost,
     PulseResult,
+    ShoppingExtraction,
+    ShoppingItem,
+    ShoppingResult,
     SourceRef,
     canonical,
     post_id,
@@ -151,3 +156,59 @@ def test_pulse_result_is_ok_with_a_digest():
         topic="AI", summary="s", posts=[], asked_at=datetime(2026, 8, 9, tzinfo=UTC)
     )
     assert PulseResult(topic="AI", digest=digest).ok
+
+
+# --- shopping ------------------------------------------------------------- #
+
+
+def test_journal_entry_union_discriminates_all_three_kinds():
+    """The journal is read back through this adapter, so a kind it cannot tag is a
+    line that vanishes on replay."""
+    adapter = TypeAdapter(JournalEntry)
+
+    mark = adapter.validate_python(
+        {"kind": "item_mark", "name": "oat milk", "action": "bought",
+         "at": "2026-08-09T10:00:00Z"}
+    )
+    assert isinstance(mark, ItemMark)
+    assert adapter.validate_json(mark.model_dump_json()) == mark
+
+
+def test_journal_lines_written_before_item_marks_existed_still_parse():
+    """Old files outnumber new ones; adding a kind must not orphan them."""
+    adapter = TypeAdapter(JournalEntry)
+    capture = adapter.validate_python(
+        {"kind": "capture", "id": str(thought_id(1, 1)), "chat_id": 1, "message_id": 1,
+         "text": "hi", "captured_at": "2026-08-01T10:00:00Z"}
+    )
+    assert isinstance(capture, CaptureRecord)
+
+
+def test_item_mark_is_frozen():
+    mark = ItemMark(name="bananas", at=datetime(2026, 8, 9, tzinfo=UTC))
+    with pytest.raises(ValidationError):
+        mark.name = "oranges"  # type: ignore[misc]
+
+
+def test_item_mark_defaults_to_bought():
+    """The overwhelmingly common action; `unbought` is the correction."""
+    assert ItemMark(name="bananas", at=datetime(2026, 8, 9, tzinfo=UTC)).action == "bought"
+
+
+def test_shopping_item_canonicalises_its_name():
+    """Dedup rides on this: two spellings of one thing must collapse."""
+    assert ShoppingItem(name="Oat  Milk").canonical_name == "oat milk"
+    assert ShoppingItem(name=" bananas ").canonical_name == "bananas"
+
+
+def test_empty_extraction_is_valid():
+    """A Shopping thought can legitimately contain nothing to buy — 'Sony or Bose?'
+    is a deliberation, not a list."""
+    assert ShoppingExtraction().items == []
+
+
+def test_shopping_result_ok_tracks_the_error_not_the_item_count():
+    """Extracting zero items is a success; the reply says so honestly."""
+    empty = ShoppingResult(thought_id=thought_id(1, 1))
+    assert empty.ok
+    assert not ShoppingResult(thought_id=thought_id(1, 1), error="model exploded").ok

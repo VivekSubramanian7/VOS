@@ -17,10 +17,12 @@ from typing import Protocol
 from vos.contracts import (
     CaptureResult,
     GraphStats,
+    ItemView,
     NoteView,
     PostView,
     PulsePost,
     PulseResult,
+    ShoppingResult,
     SourceRef,
     ThoughtView,
     VideoNote,
@@ -433,6 +435,71 @@ def render_search(notes: list[NoteView], posts: list[PostView], term: str) -> st
     return "\n".join(lines)
 
 
+class Labelled(Protocol):
+    """Anything with a shopping-item shape. Structural, so a freshly extracted item and
+    the row it became share one renderer."""
+
+    name: str
+    quantity: str | None
+    note: str | None
+
+
+def _item_label(item: Labelled) -> str:
+    """`oat milk · 2L (the barista one)` — quantity and qualifier only when there is
+    one, so a plain item stays a plain word."""
+    label = escape(item.name)
+    if item.quantity:
+        label += f" · {escape(item.quantity)}"
+    if item.note:
+        label += f" <i>({escape(item.note)})</i>"
+    return label
+
+
+def render_shopping_update(result: ShoppingResult) -> str:
+    """The reply after a Shopping thought has been through extraction."""
+    if not result.ok:
+        return (
+            "🛒 Couldn't turn that into a list — "
+            f"<i>{escape(result.error or 'unknown reason')}</i>.\n"
+            "The thought itself is saved, and I'll try again on the next restart."
+        )
+
+    if not result.items:
+        # Said out loud rather than left silent: a Shopping thought that legitimately
+        # contains nothing to buy is indistinguishable, from the outside, from one the
+        # bot quietly dropped.
+        return "🛒 Nothing to add to the list from that one."
+
+    lines = ["🛒 <b>Added to your list</b>"]
+    lines.extend(f"• {_item_label(item)}" for item in result.items)
+    lines.append("\n/shopping to see the whole list.")
+    return "\n".join(lines)
+
+
+def render_shopping_list(items: list[ItemView], bought: int = 0) -> str:
+    """The `/shopping` message.
+
+    Numbered because the numbers are an interface: `/bought 2` has to mean the row the
+    user is looking at, which is also why the store orders by `added_at` and new items
+    append at the bottom instead of shuffling the list.
+    """
+    if not items:
+        body = "Nothing on it."
+        if bought:
+            body += f"\n\n<i>{bought} already bought.</i>"
+        return (
+            "🛒 <b>Shopping list</b>\n\n"
+            + body
+            + "\n\nSend me a thought like “need bananas and 2L oat milk”."
+        )
+
+    lines = ["🛒 <b>Shopping list</b>", ""]
+    lines.extend(f"{n}. {_item_label(item)}" for n, item in enumerate(items, start=1))
+    if bought:
+        lines.append(f"\n<i>{bought} already bought.</i>")
+    return "\n".join(lines)
+
+
 HELP = """\
 <b>VOS</b> — send me a thought and I'll file it.
 
@@ -462,4 +529,9 @@ Send a YouTube link and I'll distil it automatically.
 /pulse [topic] — best of the last 24h on X (defaults to AI)
 /follow x @handle — weight someone's posts in the digest
 /more — every post or claim from the last digest or video
+
+<b>Shopping</b>
+Say what you need and I'll add it: “out of coffee, and 2L oat milk”.
+/shopping — the list, with a button per item to tick off
+/bought &lt;name|number&gt; — tick something off by typing
 """

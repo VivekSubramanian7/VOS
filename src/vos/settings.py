@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # Back this up.
     vos_artifact_dir: Path = Field(default=Path("./artifacts"), alias="VOS_ARTIFACT_DIR")
 
+    # The shopping list. Unlike the artifacts above, this one *is* disposable: every
+    # row rebuilds from the journal, so it needs no backup.
+    vos_shopping_db: Path = Field(default=Path("./shopping.db"), alias="VOS_SHOPPING_DB")
+
     # --- X pulse (optional) ---------------------------------------------
     # Absent key means /pulse is off; nothing else changes. Live Search bills
     # $0.025 per source on top of tokens, so `max_sources` is the cost lever:

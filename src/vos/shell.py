@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -27,14 +28,34 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+)
 
 from vos.cassette import BudgetGuard, Cassette
-from vos.contracts import CaptureRecord, CaptureResult, SourceKind, SourceRef
+from vos.contracts import (
+    CaptureRecord,
+    CaptureResult,
+    ItemMark,
+    ItemView,
+    SourceKind,
+    SourceRef,
+    canonical,
+)
 from vos.graph import Neo4jGraph
 from vos.jobs import JobQueue
 from vos.journal import JsonlJournal
-from vos.projection import classify_one, process_video, reproject_missing, run_pulse
+from vos.projection import (
+    classify_one,
+    process_shopping,
+    process_video,
+    reproject_missing,
+    run_pulse,
+)
 from vos.pulse import normalise_handle
 from vos.render import (
     HELP,
@@ -44,6 +65,8 @@ from vos.render import (
     render_following,
     render_pulse,
     render_search,
+    render_shopping_list,
+    render_shopping_update,
     render_stats,
     render_thoughts,
     render_video,
@@ -96,6 +119,8 @@ class VosBot:
         jobs: JobQueue | None = None,
         pulse_fetcher: Any = None,
         pulse_topic: str = "AI",
+        shopping: Any = None,
+        shopping_pipeline: Any = None,
     ) -> None:
         self.journal = journal
         self.graph = graph
@@ -106,6 +131,8 @@ class VosBot:
         self.jobs = jobs
         self.pulse_fetcher = pulse_fetcher
         self.pulse_topic = pulse_topic
+        self.shopping = shopping
+        self.shopping_pipeline = shopping_pipeline
 
     # -- capture -------------------------------------------------------- #
 
@@ -142,14 +169,17 @@ class VosBot:
         result = await self._enrich(record)
         await _replace(ack, message.answer, render_capture(result))
 
-        # A video link gets queued rather than processed here: distillation takes
-        # 20-60s and the polling loop must not stall for it.
+        # Follow-on work gets queued rather than processed here: both are further model
+        # calls, and the polling loop must not stall for them.
+        if result.classification is None:
+            return
         if (
-            result.classification is not None
-            and result.classification.category == "VideoKnowledge"
+            result.classification.category == "VideoKnowledge"
             and (video_id := find_video_id(text)) is not None
         ):
             await self._queue_video(message.answer, video_id, record.id)
+        elif result.classification.category == "Shopping":
+            await self._queue_shopping(message.answer, record)
 
     async def _enrich(self, record: CaptureRecord) -> CaptureResult:
         if self.budget and self.budget.exceeded():
@@ -273,6 +303,203 @@ class VosBot:
             await _replace(note, message.answer, render_pulse(result))
 
         await self.jobs.submit(f"pulse:{topic}", job)
+
+    # -- shopping ------------------------------------------------------- #
+
+    async def _queue_shopping(
+        self, answer: Callable[..., Awaitable[Any]], record: CaptureRecord
+    ) -> None:
+        """Enqueue item extraction and post the result when it lands.
+
+        Takes an `answer` callable rather than a Message for the same reason
+        `_queue_video` does: startup recovery has no incoming message to reply to.
+        """
+        if self.shopping_pipeline is None or self.shopping is None or self.jobs is None:
+            return
+        if self.budget and self.budget.exceeded():
+            # Silent rather than a message: on the capture path the user has just been
+            # told the budget is gone, and on the recovery path there is nobody to tell.
+            # The thought stays unextracted, so the next restart picks it up.
+            return
+
+        async def job() -> None:
+            note = await answer("🛒 Making a list…")
+            try:
+                result = await process_shopping(
+                    self.shopping_pipeline, self.shopping, record
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Shopping job failed for %s", record.id)
+                await note.edit_text(
+                    f"🛒 Couldn't build the list: <i>{type(exc).__name__}</i>. "
+                    "The thought itself is saved."
+                )
+                return
+            await _replace(note, answer, render_shopping_update(result))
+
+        await self.jobs.submit(f"shopping:{record.id}", job)
+
+    async def _list_state(self) -> tuple[str, InlineKeyboardMarkup | None]:
+        """Render the list and the keyboard together.
+
+        One place, because the two have to agree: a button pointing at a row the text
+        does not show is precisely how a tap buys the wrong thing.
+        """
+        items = await self.shopping.pending_items()
+        bought = await self.shopping.bought_count()
+        undo = await self.shopping.last_bought()
+        return (
+            render_shopping_list(items, bought),
+            _shopping_keyboard(items, undo=undo is not None),
+        )
+
+    async def cmd_shopping(self, message: Message) -> None:
+        if self.shopping is None:
+            await message.answer("🛒 Shopping isn't enabled.")
+            return
+        text, markup = await self._list_state()
+        await _send_list(message.answer, text, markup)
+
+    async def _tick(
+        self, callback: CallbackQuery, name: str, action: str, toast: str
+    ) -> None:
+        """Journal the decision, apply it, then redraw.
+
+        Same contract as `/undo`: the journal leads and the projection follows, so a
+        crash in between costs a redraw rather than the decision — startup replay puts
+        it back.
+        """
+        now = datetime.now(UTC)
+        try:
+            await self.journal.append(ItemMark(name=name, action=action, at=now))
+        except OSError as exc:
+            log.exception("Journal write failed for item mark %r", name)
+            await callback.answer(
+                f"Couldn't save that ({exc.__class__.__name__}). Try again.",
+                show_alert=True,
+            )
+            return
+
+        with contextlib.suppress(Exception):
+            await self.shopping.mark(name, action, now)
+
+        await callback.answer(toast)
+        await self._redraw(callback.message)
+
+    async def _redraw(self, message: Any) -> None:
+        """Update the list in place.
+
+        Editing rather than sending: in a shop the list should stay one message you
+        keep glancing at, not a thread that grows by one every time you pick something
+        up.
+        """
+        if message is None:
+            return
+        text, markup = await self._list_state()
+        # Telegram raises rather than no-ops when the text is unchanged, and again when
+        # a message is too old to edit. Neither is worth surfacing — the tick is saved
+        # either way, and the next /shopping renders fresh.
+        with contextlib.suppress(Exception):
+            await message.edit_text(text, reply_markup=markup)
+
+    async def on_buy_callback(self, callback: CallbackQuery) -> None:
+        if self.shopping is None:
+            await callback.answer("Shopping isn't enabled.")
+            return
+
+        item_id, digest = _parse_ref(callback.data or "")
+        if item_id is None:
+            await callback.answer("I don't recognise that button.")
+            return
+
+        item = await self.shopping.item_by_id(item_id)
+        if item is None or _digest(item.canonical_name) != digest:
+            # The row was reused by a rebuild, or the item is gone. Refusing is the
+            # entire reason the digest is carried: the alternative is silently buying
+            # whatever now occupies that row.
+            await callback.answer(
+                "That list is out of date — send /shopping again.", show_alert=True
+            )
+            return
+
+        await self._tick(callback, item.name, "bought", f"✓ {item.name}")
+
+    async def on_unbuy_callback(self, callback: CallbackQuery) -> None:
+        """Undo the last tick — the correction for a mis-tap, which is the failure a
+        keyboard of adjacent buttons actually has."""
+        if self.shopping is None:
+            await callback.answer("Shopping isn't enabled.")
+            return
+        last = await self.shopping.last_bought()
+        if last is None:
+            await callback.answer("Nothing to undo.")
+            return
+        await self._tick(callback, last.name, "unbought", f"↩ {last.name}")
+
+    async def cmd_bought(self, message: Message, command: CommandObject) -> None:
+        """Text fallback for the buttons.
+
+        Kept because the `/shopping` message scrolls away mid-shop, and voice-typing
+        "bought milk" beats scrolling back to find it.
+        """
+        if self.shopping is None:
+            await message.answer("🛒 Shopping isn't enabled.")
+            return
+
+        term = (command.args or "").strip()
+        if not term:
+            await message.answer(
+                "Usage: <code>/bought oat milk</code> or <code>/bought 2</code>"
+            )
+            return
+
+        items = await self.shopping.pending_items()
+        match, candidates = resolve_item(term, items)
+        if match is None:
+            if candidates:
+                names = "\n".join(f"• {escape(i.name)}" for i in candidates)
+                await message.answer(f"Which one?\n{names}")
+            else:
+                await message.answer(f"Nothing on the list matches “{escape(term)}”.")
+            return
+
+        now = datetime.now(UTC)
+        try:
+            await self.journal.append(ItemMark(name=match.name, action="bought", at=now))
+        except OSError as exc:
+            log.exception("Journal write failed for item mark %r", match.name)
+            await message.answer(
+                f"❌ Couldn't save that (<i>{exc.__class__.__name__}</i>). Try again."
+            )
+            return
+
+        with contextlib.suppress(Exception):
+            await self.shopping.mark(match.name, "bought", now)
+
+        await message.answer(f"✓ <b>{escape(match.name)}</b>")
+
+    async def requeue_unextracted_shopping(
+        self, answer: Callable[..., Awaitable[Any]]
+    ) -> int:
+        """Startup recovery for the non-durable queue.
+
+        Outstanding work is what the graph knows is filed under Shopping, minus what
+        the store has finished with. Two stores, one question — the standing cost of
+        keeping list state out of the graph (ADR-010), and it is paid only here.
+        """
+        if self.shopping_pipeline is None or self.shopping is None or self.jobs is None:
+            return 0
+
+        done = await self.shopping.extracted_ok_ids()
+        by_id = {r.id: r for r in self.journal.records()}
+        queued = 0
+        for thought in await self.graph.category_thought_ids("Shopping"):
+            record = by_id.get(thought)
+            if thought in done or record is None:
+                continue
+            await self._queue_shopping(answer, record)
+            queued += 1
+        return queued
 
     async def cmd_more(self, message: Message, command: CommandObject) -> None:
         """Every stored claim for a video, not just the ones the reply had room for.
@@ -466,13 +693,103 @@ class VosBot:
         r.message.register(self.cmd_pulse, Command("pulse"))
         r.message.register(self.cmd_notes, Command("notes"))
         r.message.register(self.cmd_more, Command("more"))
+        r.message.register(self.cmd_shopping, Command("shopping"))
+        r.message.register(self.cmd_bought, Command("bought"))
         r.message.register(self.on_voice, F.voice | F.audio | F.video_note)
         # Registered last: anything not matched above is a thought.
         r.message.register(self.capture, F.text)
+        # Taps, not messages. The owner middleware sits on `dp.update`, so these are
+        # already gated by it — a callback carries `event_from_user` like any update.
+        r.callback_query.register(self.on_buy_callback, F.data.startswith("buy:"))
+        r.callback_query.register(self.on_unbuy_callback, F.data == "unbuy:last")
         return r
 
 
 # --- helpers ------------------------------------------------------------ #
+
+# Telegram accepts 100 buttons, but a keyboard longer than a screen stops being
+# faster than typing. Past this the list still renders in full and `/bought` still
+# works — only the taps stop, which is why the cap is safe to be blunt about.
+MAX_ITEM_BUTTONS = 40
+
+
+def _digest(canonical_name: str) -> str:
+    return hashlib.sha1(
+        canonical_name.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:8]
+
+
+def _item_ref(item: ItemView) -> str:
+    """`buy:<row id>:<name digest>`.
+
+    The row id alone would be unsafe. `--rebuild` reassigns ids, so a button tapped
+    from a message sent before one could tick off whatever now occupies that row.
+    Pairing the id with a digest of the name turns that into a refusal instead of a
+    wrong purchase, and both together sit far inside Telegram's 64-byte budget.
+    """
+    return f"buy:{item.id}:{_digest(item.canonical_name)}"
+
+
+def _parse_ref(data: str) -> tuple[int | None, str]:
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "buy" or not parts[1].isdigit():
+        return None, ""
+    return int(parts[1]), parts[2]
+
+
+def _shopping_keyboard(
+    items: list[ItemView], *, undo: bool = False
+) -> InlineKeyboardMarkup | None:
+    """One tap-to-buy button per item, plus Undo once there is something to undo."""
+    rows = [
+        [InlineKeyboardButton(text=f"✓ {item.name}"[:60], callback_data=_item_ref(item))]
+        for item in items[:MAX_ITEM_BUTTONS]
+    ]
+    if undo:
+        rows.append(
+            [InlineKeyboardButton(text="↩ Undo last", callback_data="unbuy:last")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def _send_list(
+    answer: Callable[..., Awaitable[Any]], text: str, markup: InlineKeyboardMarkup | None
+) -> Any:
+    """Send a rendered list, keeping the keyboard on the final chunk.
+
+    A keyboard belongs to exactly one message, and the buttons are the actionable
+    part, so they go on the message the user is left looking at.
+    """
+    chunks = split_message(text)
+    for chunk in chunks[:-1]:
+        await answer(chunk)
+    return await answer(chunks[-1], reply_markup=markup)
+
+
+def resolve_item(
+    term: str, items: list[ItemView]
+) -> tuple[ItemView | None, list[ItemView]]:
+    """Work out which item a `/bought` argument means.
+
+    Returns (match, candidates): a match, or the candidates to disambiguate between.
+    Pure, so the matching rules are testable without a Telegram transport.
+
+    A number indexes the list exactly as rendered. Otherwise an exact name wins
+    outright, and a substring is an answer only when it is unambiguous — asking is
+    cheap, and ticking off the wrong thing is discovered at the till.
+    """
+    term = term.strip()
+    if term.isdigit():
+        index = int(term)
+        return (items[index - 1], []) if 1 <= index <= len(items) else (None, [])
+
+    key = canonical(term)
+    for item in items:
+        if item.canonical_name == key:
+            return item, []
+
+    matches = [i for i in items if key in i.canonical_name]
+    return (matches[0], []) if len(matches) == 1 else (None, matches)
 
 
 def _int_arg(raw: str | None, *, default: int, maximum: int) -> int:
@@ -545,8 +862,15 @@ async def run() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s"
     )
-    from vos.pipeline import build_pipeline, build_video_pipeline, load_model
+    from vos.pipeline import (
+        build_pipeline,
+        build_shopping_pipeline,
+        build_video_pipeline,
+        load_model,
+    )
+    from vos.projection import replay_item_marks
     from vos.settings import get_settings
+    from vos.shopping import SqliteShoppingStore
 
     settings = get_settings()
 
@@ -557,17 +881,28 @@ async def run() -> None:
     graph = Neo4jGraph.connect(
         settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password.get_secret_value()
     )
+    shopping = SqliteShoppingStore(settings.vos_shopping_db)
 
     model = load_model(settings.vos_model)
     pipeline = build_pipeline(model, model_name=settings.vos_model, cassette=cassette)
     video_pipeline = build_video_pipeline(
         model, fetcher, model_name=settings.vos_model, cassette=cassette
     )
+    shopping_pipeline = build_shopping_pipeline(
+        model, model_name=settings.vos_model, cassette=cassette
+    )
 
     await graph.ensure_schema()
+    await shopping.ensure_schema()
     recovered = await reproject_missing(journal, graph)
     if recovered:
         log.info("Recovered %d thought(s) from the journal into the graph.", len(recovered))
+
+    # Closes the crash window between a tick reaching the journal and reaching the
+    # list, and restores the whole list after a `--rebuild`. Cheap and idempotent, so
+    # it runs unconditionally rather than only when something looks wrong.
+    if marks := await replay_item_marks(journal, shopping):
+        log.info("Replayed %d shopping mark(s) from the journal.", marks)
 
     jobs = JobQueue(concurrency=1)  # single writer — see ADR-008
     await jobs.start()
@@ -598,15 +933,19 @@ async def run() -> None:
         jobs=jobs,
         pulse_fetcher=pulse_fetcher,
         pulse_topic=settings.vos_pulse_topic,
+        shopping=shopping,
+        shopping_pipeline=shopping_pipeline,
     )
 
-    async def announce(text: str):
-        return await bot.send_message(settings.vos_allowed_user_id, text)
+    async def announce(text: str, **kwargs: Any):
+        return await bot.send_message(settings.vos_allowed_user_id, text, **kwargs)
 
     # The job queue is in-memory, so a restart loses whatever was waiting. Outstanding
     # work is recovered from the graph rather than persisted (see vos.jobs).
     if requeued := await vos.requeue_unprocessed_videos(announce):
         log.info("Re-queued %d unprocessed video(s).", requeued)
+    if requeued := await vos.requeue_unextracted_shopping(announce):
+        log.info("Re-queued %d unextracted shopping thought(s).", requeued)
 
     dp = Dispatcher()
     dp.update.outer_middleware(AllowOnlyOwner(settings.vos_allowed_user_id))
@@ -618,6 +957,7 @@ async def run() -> None:
     finally:
         await jobs.stop()
         await graph.close()
+        await shopping.close()
         await bot.session.close()
 
 

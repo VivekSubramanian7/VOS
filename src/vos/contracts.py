@@ -89,7 +89,8 @@ class CaptureRecord(BaseModel):
 
     model_config = {"frozen": True}
 
-    # Discriminator: the journal is a tagged union of capture and tombstone lines.
+    # Discriminator: the journal is a tagged union of capture, tombstone, and
+    # item-mark lines.
     kind: Literal["capture"] = "capture"
     id: UUID
     chat_id: int
@@ -132,7 +133,27 @@ class Tombstone(BaseModel):
     deleted_at: datetime
 
 
-JournalEntry = Annotated[CaptureRecord | Tombstone, Field(discriminator="kind")]
+class ItemMark(BaseModel):
+    """Appended when a shopping item is ticked off, or un-ticked.
+
+    Bought-ness is a decision the person made, not something a model derived, so it
+    belongs in the journal rather than only in a projection. Without it `vos reclassify
+    --rebuild` — a normal operation here, not a recovery procedure — would silently
+    reset the whole list to pending. Same shape as `Tombstone`: the action is appended,
+    never applied by editing an earlier line.
+    """
+
+    model_config = {"frozen": True}
+
+    kind: Literal["item_mark"] = "item_mark"
+    name: str
+    action: Literal["bought", "unbought"] = "bought"
+    at: datetime
+
+
+JournalEntry = Annotated[
+    CaptureRecord | Tombstone | ItemMark, Field(discriminator="kind")
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -538,3 +559,101 @@ class PulseError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+# --------------------------------------------------------------------------- #
+# Shopping list
+# --------------------------------------------------------------------------- #
+
+
+class ShoppingItem(BaseModel):
+    """One thing to buy. These field descriptions are part of the prompt."""
+
+    name: str = Field(
+        max_length=80,
+        description=(
+            "The thing to buy, as it would be written on a list: 'oat milk', "
+            "not 'a carton of oat milk'"
+        ),
+    )
+    quantity: str | None = Field(
+        default=None,
+        max_length=40,
+        description="How much, only when stated: '2L', 'a dozen'. Omit if not said.",
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=120,
+        description=(
+            "A qualifier that changes which product to pick: 'unsalted', 'the barista one'"
+        ),
+    )
+
+    @property
+    def canonical_name(self) -> str:
+        return canonical(self.name)
+
+
+class ShoppingExtraction(BaseModel):
+    """The extractor's contract. An empty list is a valid answer — plenty of Shopping
+    thoughts are deliberations ("Sony or Bose?") rather than things to buy."""
+
+    items: list[ShoppingItem] = Field(default_factory=list)
+
+
+class ItemView(BaseModel):
+    """An item as read back out of the store."""
+
+    id: int
+    """Row id. Doubles as the callback reference for the tap-to-buy button, paired
+    with a hash of the name so a stale keyboard cannot buy the wrong thing."""
+    name: str
+    canonical_name: str
+    status: Literal["pending", "bought"] = "pending"
+    added_at: datetime
+    bought_at: datetime | None = None
+    quantity: str | None = None
+    note: str | None = None
+    sources: int = 1
+    """How many separate thoughts asked for this. >1 means you mentioned it twice."""
+
+
+class ShoppingResult(BaseModel):
+    """Outcome of extracting one thought — what the user is told."""
+
+    thought_id: UUID
+    items: list[ShoppingItem] = Field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+@runtime_checkable
+class ShoppingStore(Protocol):
+    """The shopping list projection.
+
+    Deliberately not the graph (ADR-010): list state is small, mutable, and relational,
+    and modelling it as nodes would grow the graph with rows no traversal benefits from.
+    Like the graph, it is disposable — every row is rederivable from the journal.
+    """
+
+    async def ensure_schema(self) -> None: ...
+
+    async def add(
+        self, thought_id: UUID, items: list[ShoppingItem], captured_at: datetime
+    ) -> None: ...
+
+    async def mark(self, name: str, action: str, at: datetime) -> str | None: ...
+    async def pending_items(self) -> list[ItemView]: ...
+    async def bought_count(self) -> int: ...
+    async def item_by_id(self, item_id: int) -> ItemView | None: ...
+    async def last_bought(self) -> ItemView | None: ...
+    async def record_extraction(
+        self, thought_id: UUID, error: str | None = None
+    ) -> None: ...
+
+    async def extracted_ok_ids(self) -> set[UUID]: ...
+    async def wipe(self) -> None: ...
+    async def close(self) -> None: ...

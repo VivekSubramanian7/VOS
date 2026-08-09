@@ -45,10 +45,13 @@ class FakeReply:
     def __init__(self) -> None:
         self.text: str | None = None
         self.edits: list[str] = []
+        self.markup: Any = None
 
-    async def edit_text(self, text: str, **_: Any) -> None:
+    async def edit_text(self, text: str, **kwargs: Any) -> None:
         self.edits.append(text)
         self.text = text
+        if "reply_markup" in kwargs:
+            self.markup = kwargs["reply_markup"]
 
     @property
     def final(self) -> str:
@@ -67,9 +70,10 @@ class FakeMessage:
         self.chat = FakeChat()
         self.replies: list[FakeReply] = []
 
-    async def answer(self, text: str, **_: Any) -> FakeReply:
+    async def answer(self, text: str, **kwargs: Any) -> FakeReply:
         reply = FakeReply()
         reply.text = text
+        reply.markup = kwargs.get("reply_markup")
         self.replies.append(reply)
         return reply
 
@@ -281,6 +285,15 @@ class FakeGraph:
 
     async def unprocessed_video_thoughts(self):
         return []
+
+    async def category_thought_ids(self, category: str):
+        return [
+            tid
+            for tid, entry in self.thoughts.items()
+            if entry.get("classification") is not None
+            and entry["classification"].category == category
+            and entry["status"] != "deleted"
+        ]
 
     @staticmethod
     def _view(entry: dict) -> ThoughtView:

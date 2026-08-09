@@ -40,6 +40,7 @@ uv run vos-bot                # long-polling; no public URL needed
 | `/follow person\|book\|channel <…>` · `/following` · `/unfollow <name>` | Declare what shapes your thinking |
 | *(a YouTube link)* | Distilled automatically into timestamped notes |
 | `/video <url>` · `/notes <term>` · `/redistil <url>` | Process now · search video notes · re-run from cache |
+| `/shopping` · `/bought <name\|number>` | The shopping list, with a tap-to-buy button per item |
 
 ### X pulse
 
@@ -53,6 +54,22 @@ notes.
 **This costs money.** Live Search bills $0.025 per source, so a 25-source digest is
 about $0.63. Lower `VOS_PULSE_MAX_SOURCES` to spend less. The daily budget guard
 refuses a pulse once `VOS_DAILY_BUDGET_USD` is reached, and `/stats` shows the spend.
+
+### Shopping
+
+Say what you need the way you would say it to a person — "out of coffee, and 2L oat
+milk" — and the things to buy are pulled out of the thought and put on a list. There is
+no syntax and no "add item" mode, so putting something on the list costs no more than
+mentioning it.
+
+`/shopping` shows the list with a button per item; tapping one ticks it off and edits
+the message in place, so at the shop you keep looking at one message rather than a
+growing thread. `↩ Undo last` reverses a mis-tap. `/bought oat milk` or `/bought 2` does
+the same by typing, for when the list has scrolled away.
+
+Ticks are written to the journal, so they survive `vos reclassify --rebuild`. The list
+itself lives in `shopping.db`, which is disposable — see
+[docs/pipelines/shopping.md](docs/pipelines/shopping.md).
 
 ## Operations
 

@@ -27,6 +27,8 @@ from vos.contracts import (
     Classification,
     PulseError,
     PulseResult,
+    ShoppingResult,
+    ShoppingStore,
     VideoResult,
     pulse_id,
 )
@@ -177,6 +179,51 @@ async def run_pulse(
     )
 
 
+async def process_shopping(
+    shopping_pipeline, store: ShoppingStore, record: CaptureRecord
+) -> ShoppingResult:
+    """Run the extraction pipeline and project the outcome onto the list.
+
+    Mirrors `process_video`: the pipeline produces data, this writes it, and nothing
+    here raises. The thought is already captured and filed by the time this runs, so a
+    failed extraction costs a list entry, not a thought.
+    """
+    from vos.pipeline import ShoppingState
+
+    out = await shopping_pipeline.ainvoke(ShoppingState(record=record))
+    extraction = out.get("extraction")
+    error = out.get("error")
+
+    if error or extraction is None:
+        reason = error or "no items extracted"
+        # Best-effort: the failure is already the outcome being reported, and losing
+        # the marker only costs one retry on the next restart.
+        with contextlib.suppress(Exception):
+            await store.record_extraction(record.id, error=reason)
+        return ShoppingResult(thought_id=record.id, error=reason)
+
+    await store.add(record.id, extraction.items, record.captured_at)
+    await store.record_extraction(record.id)
+    return ShoppingResult(thought_id=record.id, items=extraction.items)
+
+
+async def replay_item_marks(journal: JsonlJournal, store: ShoppingStore) -> int:
+    """Re-apply every shopping tick recorded in the journal. Returns how many.
+
+    Run on every startup *and* after a rebuild, for two different reasons. On startup
+    it closes the crash window between the journal append and the store write, exactly
+    as `reproject_missing` does for thoughts. After a rebuild it is the only thing
+    standing between the user and a list that has silently un-bought itself.
+
+    Idempotent and order-independent: the store gates each mark on its timestamp.
+    """
+    marks = journal.item_marks()
+    for mark in marks:
+        with contextlib.suppress(Exception):
+            await store.mark(mark.name, mark.action, mark.at)
+    return len(marks)
+
+
 def select(
     records: Iterable[CaptureRecord], since: datetime | None = None
 ) -> list[CaptureRecord]:
@@ -191,15 +238,28 @@ async def rebuild(
     since: datetime | None = None,
     wipe: bool = True,
     progress=None,
+    shopping: ShoppingStore | None = None,
 ) -> tuple[int, int]:
     """Replay the journal into a fresh projection. Returns (succeeded, failed).
 
-    Wiping is safe precisely because the graph is derived — this is a normal
+    Wiping is safe precisely because both projections are derived — this is a normal
     operation, not a recovery procedure.
+
+    The shopping list is rebuilt in two halves. Ticks replay here, immediately, because
+    they exist only in the journal. Items do *not*: extraction costs a model call each,
+    so the emptied `extractions` table is left to say "nothing has been extracted", and
+    the next bot startup re-queues the work in the background. A tick that lands before
+    its item is re-extracted still resolves correctly — that is what the store's
+    timestamp gate is for.
     """
     if wipe:
         await graph.wipe()
         await graph.ensure_schema()
+        if shopping is not None:
+            await shopping.wipe()
+
+    if shopping is not None:
+        await replay_item_marks(journal, shopping)
 
     records = select(journal.records(), since)
     ok = failed = 0

@@ -10,6 +10,9 @@ journal/
 artifacts/
 cassettes/
 neo4j-data/
+shopping.db
+shopping.db-wal
+shopping.db-shm
 
 # Python
 __pycache__/

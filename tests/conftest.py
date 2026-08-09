@@ -60,8 +60,10 @@ async def graph(neo4j_uri: str, neo4j_password: str) -> AsyncIterator[Neo4jGraph
     from vos.graph import Neo4jGraph
 
     store = Neo4jGraph.connect(neo4j_uri, "neo4j", neo4j_password)
-    await store.ensure_schema()
+    # Wipe *then* ensure: the same order `--rebuild` uses, so each test starts from
+    # the state a production startup actually produces — seeded categories included.
     await store.wipe()
+    await store.ensure_schema()
     try:
         yield store
     finally:

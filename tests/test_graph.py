@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from vos.contracts import (
+    CATEGORIES,
     CaptureRecord,
     Classification,
     ExtractedEntity,
@@ -627,3 +628,63 @@ async def test_latest_pulse_is_none_on_an_empty_graph(graph):
 async def test_saving_a_digest_with_no_posts_is_fine(graph):
     """A quiet day still records that we asked."""
     assert await graph.save_pulse(_digest()) == 0
+
+
+# --- category seeding and shopping recovery -------------------------------- #
+
+
+async def test_every_category_exists_after_ensure_schema(graph: Neo4jGraph):
+    """The vocabulary is fixed and known up front, so an empty category is a real
+    thing containing nothing — not a category that does not exist. Before seeding,
+    a browser looking at the graph saw only whatever the last few weeks contained.
+    """
+    rows = await graph._run("MATCH (c:Category) RETURN c.name AS name")
+    assert {r["name"] for r in rows} == set(CATEGORIES)
+
+
+async def test_seeding_categories_is_idempotent(graph: Neo4jGraph):
+    await graph.ensure_schema()
+    await graph.ensure_schema()
+
+    rows = await graph._run("MATCH (c:Category) RETURN count(c) AS n")
+    assert rows[0]["n"] == len(CATEGORIES)
+
+
+async def test_a_rebuild_reseeds_the_categories(graph: Neo4jGraph):
+    """`--rebuild` wipes then ensures, so the vocabulary must come back with it."""
+    await graph.wipe()
+    await graph.ensure_schema()
+
+    rows = await graph._run("MATCH (c:Category) RETURN count(c) AS n")
+    assert rows[0]["n"] == len(CATEGORIES)
+
+
+async def test_seeding_does_not_disturb_a_category_in_use(graph: Neo4jGraph):
+    record = _record(text="buy oat milk")
+    await graph.upsert_thought(record, _classification("Shopping"))
+    await graph.ensure_schema()
+
+    views = await graph.by_category("Shopping")
+    assert [v.id for v in views] == [record.id]
+
+
+async def test_category_thought_ids_returns_live_thoughts_oldest_first(graph: Neo4jGraph):
+    first = _record(1, text="buy bananas", minutes=0)
+    second = _record(2, text="buy bread", minutes=5)
+    for record in (first, second):
+        await graph.upsert_thought(record, _classification("Shopping"))
+
+    assert await graph.category_thought_ids("Shopping") == [first.id, second.id]
+
+
+async def test_category_thought_ids_excludes_deleted(graph: Neo4jGraph):
+    record = _record(text="buy bananas")
+    await graph.upsert_thought(record, _classification("Shopping"))
+    await graph.soft_delete(record.id)
+
+    assert await graph.category_thought_ids("Shopping") == []
+
+
+async def test_category_thought_ids_is_empty_for_an_unused_category(graph: Neo4jGraph):
+    """Seeded but empty. The query must return nothing rather than fail to match."""
+    assert await graph.category_thought_ids("Shopping") == []

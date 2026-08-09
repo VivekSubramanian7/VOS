@@ -24,6 +24,7 @@ from vos.journal import JsonlJournal
 from vos.pipeline import ThoughtState, build_pipeline, load_model
 from vos.projection import classify_missing, rebuild, reproject_missing, select
 from vos.settings import get_settings
+from vos.shopping import SqliteShoppingStore
 
 app = typer.Typer(add_completion=False, help="VOS operator commands.")
 log = logging.getLogger(__name__)
@@ -74,8 +75,10 @@ def reclassify(
 async def _reclassify(since_raw, model_override, dry_run, wipe) -> None:
     settings, journal, graph, pipeline, model_spec = _components(model_override)
     since = _parse_date(since_raw)
+    shopping = SqliteShoppingStore(settings.vos_shopping_db)
     try:
         await graph.ensure_schema()
+        await shopping.ensure_schema()
         records = select(journal.records(), since)
         if not records:
             typer.echo("Nothing in the journal to replay.")
@@ -118,11 +121,21 @@ async def _reclassify(since_raw, model_override, dry_run, wipe) -> None:
             typer.echo(f"\r  {i}/{total}", nl=False)
 
         ok, failed = await rebuild(
-            journal, graph, pipeline, since=since, wipe=wipe, progress=progress
+            journal, graph, pipeline, since=since, wipe=wipe, progress=progress,
+            shopping=shopping,
         )
         typer.echo(f"\nFiled {ok}." + (f" {failed} failed — see /pending." if failed else ""))
+        if wipe:
+            # Said out loud because the list looks empty until the bot comes back up,
+            # and an empty shopping list is exactly the thing a user would read as
+            # data loss rather than as work still queued.
+            typer.echo(
+                "Shopping items will be re-extracted in the background on the next "
+                "bot start. Anything you had ticked off stays ticked off."
+            )
     finally:
         await graph.close()
+        await shopping.close()
 
 
 @app.command()

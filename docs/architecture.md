@@ -336,6 +336,16 @@ miss**, so a replay can never silently reach the network.
 `CaptureResult` → the Telegram confirmation string. Separated so a second client can reuse the same
 result object with different rendering later.
 
+### 6.8 `vos.shopping` — the shopping list projection
+
+A small SQLite store (`items`, `adds`, `extractions`) behind the `ShoppingStore` protocol. Sibling to
+`vos.graph` rather than a layer on it: both are projections of the journal, both are wiped and
+replayed by `--rebuild`, and neither is a source of truth. Stdlib `sqlite3` on a worker thread, with
+the same lock-and-`to_thread` shape as `JsonlJournal.append`, so it adds no dependency.
+
+Every state transition is gated on a timestamp, which makes `add` and `mark` commutative and lets
+replay arrive in any order. See ADR-012, ADR-013, and `docs/pipelines/shopping.md`.
+
 ---
 
 ## 7. Data architecture
@@ -364,9 +374,15 @@ the first feature.
 voice needs no migration.
 
 **Categories** are seeded exactly as specified: `Shopping`, `TripPlanning`, `Family`, `Career`,
-`StudyResearch`, `StockResearch`, `VideoKnowledge`, `Other`. `Other` is an honest fallback — a
-low-confidence thought is filed there and flagged, never forced into a wrong bucket. Those flagged
-thoughts are the signal for which category to add next.
+`StudyResearch`, `StockResearch`, `VideoKnowledge`, `Other`. Seeding happens in `ensure_schema()`, so
+all eight exist from the first startup whether or not anything has been filed in them — an empty
+category is a real thing containing nothing, not a category that does not exist. `Other` is an honest
+fallback: a low-confidence thought is filed there and flagged, never forced into a wrong bucket.
+Those flagged thoughts are the signal for which category to add next.
+
+**The shopping list is not in the graph.** Thoughts filed under `Shopping` project exactly like any
+other thought, entities included; the list of things to buy lives in SQLite instead (ADR-012, and
+`docs/pipelines/shopping.md`).
 
 **Entity resolution** in Phase 1 is case-insensitive canonical-name matching, with declared sources
 taking priority. Deliberately dumb, and easy to replace once you can see where it is wrong.
@@ -390,11 +406,15 @@ infrastructure, not tuning.
 
 | Path | Contents | Backup | Rebuildable |
 |---|---|---|---|
-| `journal/YYYY-MM.jsonl` | **Source of truth** — raw captures | **Yes — this is the backup** | No |
+| `journal/YYYY-MM.jsonl` | **Source of truth** — raw captures and user actions | **Yes — this is the backup** | No |
 | Neo4j volume | Derived projection | Optional | Yes, from journal |
+| `shopping.db` | Derived projection — the shopping list | No | Yes, from journal |
+| `artifacts/` | Fetched transcripts and pulse digests | Yes — not recomputable | No |
 | `cassettes/` | Model call log | Optional (useful for eval) | No, but non-critical |
 
-Backup policy is therefore: copy `journal/`. Everything else regenerates.
+Backup policy is therefore: copy `journal/` and `artifacts/`. Everything else
+regenerates — including the shopping list, whose ticks replay from `item_mark` entries
+and whose items are re-extracted in the background on the next start (ADR-012, ADR-013).
 
 ---
 
@@ -511,6 +531,8 @@ The column that matters is the last one.
 | **009** | **Followed sources are `:Entity:Source`, not a separate node type** | Parallel `:Source` hierarchy | Mentions land on the same node as declarations with no extra relationship type; "thoughts tracing back to what I follow" is one query |
 | **010** | **X pulse digests are cached artifacts, not a third journal entry type** | A `PulseDigest` variant on `JournalEntry` | The journal is a closed `capture \| tombstone` union (§4.1, §9.1) — it holds what VOS itself captured. A digest is Grok's answer at a moment in time, fetched rather than authored, and re-asking costs real money — the same shape as a video transcript (§`docs/pipelines/video-knowledge.md`). It is cached to `artifacts/pulses/` and treated as a non-recomputable input, same backup rule as transcripts, and the journal stays two variants |
 | **011** | **Posts get their own `:Post` label, not `:Note` reused** | Store pulse items as `:Note` | `:Note` means a claim distilled from a video transcript, timestamped to the second it was said. A post is an external item fetched from X, scored and sectioned differently and with no `t_seconds`. Reusing `:Note` would force one label to carry two unrelated meanings and one fulltext index to serve two search intents (`/notes` vs `/pulse` history); `:Post` gets its own uniqueness constraint and fulltext index instead |
+| **012** | **Shopping list state lives in SQLite; the graph holds none of it** | `:Entity:Item` label reuse (the ADR-009 pattern); a separate `:Item` node type | A shopping list is a handful of rows that flip between two values and are read back in one order. As nodes that is volume with no traversal benefiting from it, and the graph's job is to stay worth looking at. SQLite is a projection in exactly the sense Neo4j is — every row rederivable from the journal, wiped and replayed by `--rebuild` — so this adds a second *derived* store, not a second source of truth. Stdlib `sqlite3` on a worker thread, so no new dependency (ADR-005) |
+| **013** | **A shopping tick is a third journal entry kind (`item_mark`)** | Bought-state only in the projection | Refines ADR-010. That ADR's closed-union argument is about *fetched* content: a digest is Grok's answer at a moment in time, authored elsewhere. Ticking an item off is a decision the user made, which is the same category as a `Tombstone` — and `/undo` set the precedent. The concrete cost of the alternative is that `vos reclassify --rebuild`, an ordinary operation here, would silently reset the list to pending and the user would find out in a shop. The rule the journal actually holds is therefore "what VOS's user authored", not "exactly two variants" |
 
 ---
 

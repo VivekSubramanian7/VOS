@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from vos import journal as journal_module
-from vos.contracts import CaptureRecord, Tombstone
+from vos.contracts import CaptureRecord, ItemMark, Tombstone
 from vos.journal import JsonlJournal
 
 
@@ -158,3 +158,59 @@ async def test_last_capture(jrnl: JsonlJournal):
 async def test_empty_journal_reads_cleanly(jrnl: JsonlJournal):
     assert list(jrnl.read_all()) == []
     assert jrnl.records() == []
+
+
+# --- shopping item marks -------------------------------------------------- #
+
+
+async def test_item_marks_are_not_captures(jrnl: JsonlJournal):
+    """The union gained a third kind, so `records()` had to stop assuming that
+    anything which is not a tombstone is a thought."""
+    await jrnl.append(_record(1))
+    await jrnl.append(ItemMark(name="oat milk", action="bought", at=datetime.now(UTC)))
+
+    assert [r.text for r in jrnl.records()] == ["thought 1"]
+    assert jrnl.last_capture().text == "thought 1"  # type: ignore[union-attr]
+
+
+async def test_item_marks_read_back_in_write_order(jrnl: JsonlJournal):
+    """No dedup, unlike `records()`: each mark is an event, and the store decides
+    which one wins by timestamp."""
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    await jrnl.append(ItemMark(name="bananas", action="bought", at=at))
+    await jrnl.append(ItemMark(name="bananas", action="unbought", at=at + timedelta(minutes=1)))
+
+    assert [(m.name, m.action) for m in jrnl.item_marks()] == [
+        ("bananas", "bought"),
+        ("bananas", "unbought"),
+    ]
+
+
+async def test_item_mark_lands_in_the_month_file_of_its_own_timestamp(
+    jrnl: JsonlJournal, tmp_path: Path
+):
+    await jrnl.append(ItemMark(name="oranges", at=datetime(2026, 3, 4, tzinfo=UTC)))
+    assert (tmp_path / "journal" / "2026-03.jsonl").exists()
+
+
+async def test_undo_does_not_disturb_the_shopping_list(jrnl: JsonlJournal):
+    """Tombstones are keyed by thought id; marks are keyed by item name. Undoing a
+    thought must not un-buy anything."""
+    record = _record(1)
+    await jrnl.append(record)
+    await jrnl.append(ItemMark(name="oat milk", at=datetime.now(UTC)))
+    await jrnl.append(Tombstone(id=record.id, deleted_at=datetime.now(UTC)))
+
+    assert jrnl.records() == []
+    assert [m.name for m in jrnl.item_marks()] == ["oat milk"]
+
+
+async def test_a_torn_mark_costs_only_itself(jrnl: JsonlJournal, tmp_path: Path):
+    await jrnl.append(_record(1))
+    await jrnl.append(ItemMark(name="bananas", at=datetime.now(UTC)))
+    path = next((tmp_path / "journal").glob("*.jsonl"))
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write('{"kind": "item_mark", "name": "half-writ')
+
+    assert [m.name for m in jrnl.item_marks()] == ["bananas"]
+    assert [r.text for r in jrnl.records()] == ["thought 1"]

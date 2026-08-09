@@ -29,6 +29,7 @@ from vos.cassette import Cassette, CassetteEntry, price
 from vos.contracts import (
     CaptureRecord,
     Classification,
+    ShoppingExtraction,
     SourceRef,
     VideoArtifact,
     VideoDistillation,
@@ -410,6 +411,135 @@ def build_video_pipeline(
     builder.set_entry_point("fetch")
     builder.add_conditional_edges("fetch", route, {"distil": "distil", END: END})
     builder.add_edge("distil", END)
+    return builder.compile()
+
+
+# =========================================================================== #
+# Shopping list
+# =========================================================================== #
+
+SHOPPING_PROMPT = """\
+You pull the things to buy out of a thought someone captured on their phone, so they
+show up on a list that person will be reading in a shop.
+
+Extract only what they intend to acquire:
+
+  "need bananas and 2L oat milk"        -> bananas; oat milk (2L)
+  "out of coffee again"                 -> coffee
+  "should I get the Sony or the Bose?"  -> nothing: a decision, not a list
+  "the oat milk I bought was watery"    -> nothing: already bought
+
+Rules:
+
+1. An empty list is a correct and common answer. A thought filed under Shopping is
+   often a deliberation, a complaint, or a note about something already owned. An
+   invented item puts a thing in front of someone in a shop that they never asked for,
+   and they have no way to tell it was you rather than them.
+2. Name each item as the person would write it on a list: "oat milk", not "a carton of
+   oat milk". Keep their words — if they wrote "washing up liquid", do not helpfully
+   translate it to "dish soap"; they will be scanning shelves for what they wrote.
+3. `quantity` only when it is stated: "2L", "a dozen", "3". Never infer one.
+4. `note` only for a qualifier that changes which product to take off the shelf:
+   "unsalted", "the barista one". Not a reason, not a shop, not a person.
+5. One entry per thing. "bananas and oranges" is two items.
+6. Resolve pronouns against the thought itself. If a reference cannot be resolved from
+   what is written, leave it out rather than guessing at the referent.
+"""
+
+
+class ShoppingState(BaseModel):
+    """State for the extraction pipeline.
+
+    A separate graph from classification for the same reason the video one is: this
+    runs later, on a worker, and re-entering the classification graph would re-run it.
+    """
+
+    record: CaptureRecord
+    extraction: ShoppingExtraction | None = None
+    error: str | None = None
+
+
+def build_shopping_pipeline(
+    model: BaseChatModel,
+    *,
+    model_name: str = "unknown",
+    cassette: Cassette | None = None,
+):
+    """Compile the shopping extraction pipeline — a single `extract` node.
+
+    A dedicated call rather than extra fields on `Classification`. Classification runs
+    on every thought and its entities are tuned for *findability*: "the oat milk I
+    bought was watery" should absolutely be findable under oat milk, and should just as
+    absolutely not add oat milk to the list. Those are different questions, and folding
+    the second into the first would couple every category's classification quality to
+    this one feature's needs.
+    """
+    structured = model.with_structured_output(ShoppingExtraction)
+
+    async def extract(state: ShoppingState) -> dict[str, Any]:
+        messages = [
+            SystemMessage(content=SHOPPING_PROMPT),
+            HumanMessage(content=state.record.text),
+        ]
+        prompt_text = "\n\n".join(str(m.content) for m in messages)
+        started = time.perf_counter()
+
+        try:
+            result = await structured.ainvoke(messages)
+        except Exception as exc:  # noqa: BLE001 - any provider failure is the same to us
+            elapsed = int((time.perf_counter() - started) * 1000)
+            log.warning("Shopping extraction failed for %s: %s", state.record.id, exc)
+            if cassette:
+                cassette.record(
+                    CassetteEntry(
+                        thought_id=state.record.id,
+                        model=f"{model_name} (shopping)",
+                        prompt=prompt_text,
+                        error=f"{type(exc).__name__}: {exc}",
+                        latency_ms=elapsed,
+                    )
+                )
+            # Returned, not raised. The thought is already captured and filed; failing
+            # to build a list out of it must not undo any of that.
+            return {"extraction": None, "error": f"{type(exc).__name__}: {exc}"}
+
+        elapsed = int((time.perf_counter() - started) * 1000)
+
+        if result is None or not isinstance(result, ShoppingExtraction):
+            msg = f"Model returned no valid ShoppingExtraction (got {type(result).__name__})"
+            log.warning("%s for %s", msg, state.record.id)
+            if cassette:
+                cassette.record(
+                    CassetteEntry(
+                        thought_id=state.record.id,
+                        model=f"{model_name} (shopping)",
+                        prompt=prompt_text,
+                        error=msg,
+                        latency_ms=elapsed,
+                    )
+                )
+            return {"extraction": None, "error": msg}
+
+        tin, tout = _usage(result)
+        if cassette:
+            cassette.record(
+                CassetteEntry(
+                    thought_id=state.record.id,
+                    model=f"{model_name} (shopping)",
+                    prompt=prompt_text,
+                    response=result.model_dump(mode="json"),
+                    input_tokens=tin,
+                    output_tokens=tout,
+                    cost_usd=price(model_name, tin, tout),
+                    latency_ms=elapsed,
+                )
+            )
+        return {"extraction": result, "error": None}
+
+    builder = StateGraph(ShoppingState)
+    builder.add_node("extract", extract)
+    builder.set_entry_point("extract")
+    builder.add_edge("extract", END)
     return builder.compile()
 
 

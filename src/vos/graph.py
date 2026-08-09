@@ -18,6 +18,7 @@ from uuid import UUID
 from neo4j import AsyncDriver, AsyncGraphDatabase
 
 from vos.contracts import (
+    CATEGORIES,
     CaptureRecord,
     Classification,
     GraphStats,
@@ -140,6 +141,21 @@ class Neo4jGraph:
         """Idempotent; safe to run on every startup."""
         for statement in SCHEMA:
             await self._run(statement)
+        await self._seed_categories()
+
+    async def _seed_categories(self) -> None:
+        """Materialise all eight categories, whether or not anything is filed there.
+
+        They used to appear only when the first thought landed in one, which made the
+        vocabulary look like whatever the last few weeks happened to contain: an empty
+        category was indistinguishable from a category that does not exist. Seeding
+        also gives the category-driven recovery queries something to match against on
+        a graph that has just been wiped.
+        """
+        await self._run(
+            "UNWIND $names AS name MERGE (:Category {name: name})",
+            names=list(CATEGORIES),
+        )
 
     # -- writes --------------------------------------------------------- #
 
@@ -745,6 +761,24 @@ class Neo4jGraph:
             """
         )
         return [_to_view(r) for r in rows]
+
+    async def category_thought_ids(self, category: str) -> list[UUID]:
+        """Live thoughts filed under one category, oldest first.
+
+        The Shopping counterpart of `unprocessed_video_thoughts`, deliberately split in
+        two: this half asks the graph what exists, and the shopping store answers what
+        has already been extracted. Neither store can answer alone — that is the cost
+        of keeping list state out of the graph (ADR-010), and it is paid here, once.
+        """
+        rows = await self._run(
+            """
+            MATCH (t:Thought)-[:IN_CATEGORY]->(:Category {name: $category})
+            WHERE t.status <> 'deleted'
+            RETURN t.id AS id ORDER BY t.created_at ASC
+            """,
+            category=category,
+        )
+        return [UUID(r["id"]) for r in rows]
 
     async def video_exists(self, video_id: str) -> bool:
         rows = await self._run(

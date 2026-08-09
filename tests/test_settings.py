@@ -123,3 +123,27 @@ def test_pulse_source_cap_is_configurable():
         VOS_PULSE_MAX_SOURCES=8,
     )
     assert settings.vos_pulse_max_sources == 8
+
+
+def test_the_shopping_db_has_a_working_default():
+    """It is disposable, so an unset path must not stop the bot starting."""
+    from pathlib import Path
+
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+    )
+    assert settings.vos_shopping_db == Path("./shopping.db")
+
+
+def test_the_shopping_db_path_is_configurable(tmp_path):
+    from pathlib import Path
+
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        VOS_ALLOWED_USER_ID=1,
+        NEO4J_PASSWORD="p",
+        VOS_SHOPPING_DB=str(tmp_path / "list.db"),
+    )
+    assert settings.vos_shopping_db == Path(tmp_path / "list.db")
