@@ -1,0 +1,296 @@
+/* VOS kitchen kiosk.
+   Palette from enamel cookware: deep green enamel, cream lettering, saffron dial.
+   System faces only — this page must render with zero external requests. */
+
+:root {
+  --enamel:      #26332b;
+  --enamel-deep: #1c2620;
+  --cream:       #f2eddf;
+  --cream-dim:   #b9bfa9;
+  --saffron:     #e8a13d;
+  --saffron-hot: #f0b358;
+  --bubble-bot:  #333f38;
+  --bubble-user: #55603f;
+  --clay:        #c96f4a;
+  --ok:          #8fae6b;
+
+  --display: "Palatino Linotype", Palatino, Georgia, serif;
+  --body: system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+html, body { height: 100%; }
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, var(--enamel) 0%, var(--enamel-deep) 100%);
+  color: var(--cream);
+  font-family: var(--body);
+  font-size: 1.15rem;
+  line-height: 1.45;
+  overscroll-behavior: none;
+}
+
+button { font: inherit; color: inherit; cursor: pointer; }
+
+:focus-visible {
+  outline: 3px solid var(--saffron);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* --- header ------------------------------------------------------------- */
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 0.9rem 1.25rem;
+}
+
+.wordmark {
+  font-family: var(--display);
+  font-size: 1.6rem;
+  letter-spacing: 0.14em;
+  color: var(--saffron);
+}
+
+.modes {
+  display: flex;
+  margin-inline: auto;
+  border: 1.5px solid var(--cream-dim);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.mode {
+  border: 0;
+  background: transparent;
+  color: var(--cream-dim);
+  padding: 0.55rem 1.6rem;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+}
+
+.mode.is-active {
+  background: var(--cream);
+  color: var(--enamel-deep);
+  font-weight: 600;
+}
+
+.dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--cream-dim);
+}
+.dot.is-ok   { background: var(--ok); }
+.dot.is-down { background: var(--clay); }
+
+/* --- feed ----------------------------------------------------------------- */
+
+.feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.bubble {
+  max-width: 78%;
+  padding: 0.75rem 1rem;
+  border-radius: 1.1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bubble.from-user {
+  align-self: flex-end;
+  background: var(--bubble-user);
+  border-bottom-right-radius: 0.3rem;
+}
+
+.bubble.from-bot {
+  align-self: flex-start;
+  background: var(--bubble-bot);
+  border-bottom-left-radius: 0.3rem;
+}
+
+.bubble.is-error { background: #4d382e; color: #f4ddd2; }
+
+.bubble .meta {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--cream-dim);
+}
+
+.bubble.is-thinking { color: var(--cream-dim); font-style: italic; }
+
+/* --- transcript confirmation ---------------------------------------------- */
+
+.confirm {
+  margin: 0 1.25rem 0.75rem;
+  padding: 0.9rem 1rem;
+  background: var(--cream);
+  color: var(--enamel-deep);
+  border-radius: 0.9rem;
+}
+
+.confirm-label {
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 0.45rem;
+}
+
+.confirm textarea {
+  width: 100%;
+  border: 1.5px solid var(--enamel);
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.7rem;
+  font: inherit;
+  font-size: 1.2rem;
+  background: #fbf8ef;
+  color: inherit;
+  resize: none;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 0.6rem;
+}
+
+/* --- buttons ---------------------------------------------------------------- */
+
+.btn {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.65rem 1.5rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.btn-primary { background: var(--saffron); color: var(--enamel-deep); }
+.btn-primary:active { background: var(--saffron-hot); }
+
+.btn-quiet {
+  background: transparent;
+  color: var(--enamel);
+  border: 1.5px solid var(--enamel);
+}
+
+/* --- dock -------------------------------------------------------------------- */
+
+.dock {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.9rem 1.25rem calc(1.1rem + env(safe-area-inset-bottom));
+}
+
+.type-form { flex: 1; }
+
+#type-input {
+  width: 100%;
+  border: 1.5px solid var(--cream-dim);
+  border-radius: 999px;
+  background: rgba(0 0 0 / 0.18);
+  color: var(--cream);
+  padding: 0.85rem 1.2rem;
+  font: inherit;
+}
+#type-input::placeholder { color: var(--cream-dim); }
+
+/* The burner dial. The one loud element on the page. */
+.mic {
+  position: relative;
+  width: 5.2rem;
+  height: 5.2rem;
+  border: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 32% 28%, var(--saffron-hot), var(--saffron) 65%);
+  box-shadow: 0 4px 14px rgba(0 0 0 / 0.35);
+  flex-shrink: 0;
+}
+
+.mic-glyph {
+  width: 2.4rem;
+  height: 2.4rem;
+  fill: var(--enamel-deep);
+  stroke: var(--enamel-deep);
+}
+
+.mic-ring {
+  position: absolute;
+  inset: -7px;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  pointer-events: none;
+}
+
+.mic.is-recording { background: radial-gradient(circle at 32% 28%, #d8836a, var(--clay) 65%); }
+.mic.is-recording .mic-ring {
+  border-color: var(--clay);
+  animation: stove-ring 1.4s ease-out infinite;
+}
+
+.mic.is-busy { opacity: 0.55; pointer-events: none; }
+
+@keyframes stove-ring {
+  0%   { transform: scale(1);    opacity: 0.9; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mic.is-recording .mic-ring { animation: none; opacity: 0.9; }
+}
+
+/* --- PIN overlay ----------------------------------------------------------------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--enamel-deep);
+}
+
+.pin-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  align-items: center;
+  text-align: center;
+  padding: 2rem;
+}
+
+.pin-card h1 {
+  font-family: var(--display);
+  letter-spacing: 0.14em;
+  color: var(--saffron);
+}
+
+.pin-card input {
+  font-size: 1.8rem;
+  text-align: center;
+  letter-spacing: 0.4em;
+  width: 9ch;
+  padding: 0.5rem;
+  border-radius: 0.6rem;
+  border: 1.5px solid var(--cream-dim);
+  background: rgba(0 0 0 / 0.18);
+  color: var(--cream);
+}
+
+.pin-error { color: var(--clay); min-height: 1.4em; }
+
+.hidden { display: none !important; }

@@ -2,10 +2,63 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VOS</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1c2620">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23e8a13d'/%3E%3C/svg%3E">
+  <title>VOS — kitchen</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <p>VOS kiosk is running. The interface arrives with the frontend story.</p>
+  <div id="pin-overlay" class="overlay hidden">
+    <form id="pin-form" class="pin-card">
+      <h1>VOS</h1>
+      <p>Enter the family PIN</p>
+      <input id="pin-input" type="password" inputmode="numeric" autocomplete="off"
+             aria-label="Family PIN">
+      <button type="submit" class="btn btn-primary">Unlock</button>
+      <p id="pin-error" class="pin-error" role="alert"></p>
+    </form>
+  </div>
+
+  <header class="top">
+    <span class="wordmark">VOS</span>
+    <nav class="modes" role="tablist" aria-label="Mode">
+      <button id="mode-capture" class="mode is-active" role="tab" aria-selected="true">
+        Capture
+      </button>
+      <button id="mode-ask" class="mode" role="tab" aria-selected="false">
+        Ask
+      </button>
+    </nav>
+    <span id="status-dot" class="dot" title="Connection"></span>
+  </header>
+
+  <main id="feed" class="feed" aria-live="polite"></main>
+
+  <section id="confirm" class="confirm hidden" aria-label="Check what I heard">
+    <label class="confirm-label" for="confirm-text">I heard — fix anything, then send</label>
+    <textarea id="confirm-text" rows="3"></textarea>
+    <div class="confirm-actions">
+      <button id="confirm-discard" class="btn btn-quiet">Discard</button>
+      <button id="confirm-send" class="btn btn-primary">Save it</button>
+    </div>
+  </section>
+
+  <footer class="dock">
+    <form id="type-form" class="type-form">
+      <input id="type-input" type="text" autocomplete="off"
+             placeholder="…or type instead" aria-label="Type a message">
+    </form>
+    <button id="mic" class="mic" aria-label="Hold a thought — tap to talk">
+      <span class="mic-ring" aria-hidden="true"></span>
+      <svg class="mic-glyph" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 15a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v5a4 4 0 0 0 4 4Z"/>
+        <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"
+              fill="none" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </footer>
+
+  <script src="/app.js"></script>
 </body>
 </html>
