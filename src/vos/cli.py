@@ -14,6 +14,7 @@ import asyncio
 import logging
 from collections import Counter
 from datetime import UTC, datetime
+from typing import Any
 
 import typer
 
@@ -225,6 +226,41 @@ def _check_model(spec: str) -> bool:
     return True
 
 
+async def _xai_get(url: str, **kwargs) -> Any:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await client.get(url, **kwargs)
+
+
+async def _check_xai_live(api_key: str, base_url: str, model: str) -> bool:
+    """Prove the key works and the model name is real, without spending anything.
+
+    Live Search bills per source, so `doctor` lists models rather than running a
+    search. That also catches the failure most likely to bite — xAI renames models,
+    and a wrong name would otherwise surface as a mid-digest error.
+    """
+    try:
+        response = await _xai_get(
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        names = {m.get("id") for m in response.json().get("data", [])}
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"✗ xAI: {type(exc).__name__}: {exc}")
+        return False
+
+    if model not in names:
+        typer.echo(f"✗ xAI: model {model} not available")
+        typer.echo(f"  Available: {', '.join(sorted(names)) or '(none returned)'}")
+        typer.echo("  Set VOS_PULSE_MODEL in .env to one of these.")
+        return False
+
+    typer.echo(f"✓ xAI key works, model {model} available")
+    return True
+
+
 async def _live_call(spec: str) -> bool:
     """One real classification. The only check that proves the key actually works."""
     from vos.contracts import CaptureRecord, thought_id
@@ -289,6 +325,17 @@ async def _doctor(live: bool = False) -> None:
         model_ok = await _live_call(settings.vos_model)
     elif live:
         typer.echo("· skipping --live: the model could not be built")
+
+    if settings.xai_api_key is None:
+        typer.echo("• xAI key not set — /pulse is disabled (everything else is fine)")
+    elif live:
+        await _check_xai_live(
+            settings.xai_api_key.get_secret_value(),
+            settings.vos_xai_base_url,
+            settings.vos_pulse_model,
+        )
+    else:
+        typer.echo("✓ xAI key present (use --live to verify it)")
 
     if not model_ok:
         # Capture would still work — the journal does not need a model. Say so, so the
