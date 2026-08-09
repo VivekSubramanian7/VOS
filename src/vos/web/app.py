@@ -65,6 +65,11 @@ class CaptureRequest(BaseModel):
     transcript: str | None = None
 
 
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+
 def build_web_app(deps: KioskDeps) -> FastAPI:
     # No docs endpoints: the kiosk has exactly one client, and an API explorer on a
     # family device is surface area with no user.
@@ -183,6 +188,18 @@ def build_web_app(deps: KioskDeps) -> FastAPI:
             # and sits in /pending; the tablet is told exactly that.
             return {"saved": True, "id": str(record.id), "status": "pending"}
         return {"saved": True, "id": str(record.id), **outcome}
+
+    @app.post("/api/chat")
+    async def chat(req: ChatRequest) -> dict:
+        """One turn of conversation. Nothing here persists: the agent holds history
+        in process memory and this endpoint stores nothing at all."""
+        if deps.chat_agent is None:
+            raise HTTPException(status_code=503, detail="chat is not enabled")
+        message = req.message.strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="empty message")
+        reply = await deps.chat_agent.reply(req.session_id, message)
+        return {"reply": reply}
 
     # Mounted last: anything that is not /api/* is the SPA.
     app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")

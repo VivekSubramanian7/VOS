@@ -355,6 +355,47 @@ async def test_capture_rejects_blank_text(tmp_path: Path):
     assert resp.status_code == 400
 
 
+# --- /api/chat -------------------------------------------------------------- #
+
+
+class FakeChatAgent:
+    def __init__(self, reply: str = "hello from VOS") -> None:
+        self._reply = reply
+        self.calls: list[tuple[str, str]] = []
+
+    async def reply(self, session_id: str, text: str) -> str:
+        self.calls.append((session_id, text))
+        return self._reply
+
+
+async def test_chat_round_trip():
+    agent = FakeChatAgent("You noted oat milk on Tuesday.")
+    app = build_web_app(_deps(chat_agent=agent))
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/chat", json={"session_id": "s1", "message": "any milk notes?"}
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"reply": "You noted oat milk on Tuesday."}
+    assert agent.calls == [("s1", "any milk notes?")]
+
+
+async def test_chat_without_an_agent_is_a_clear_503():
+    app = build_web_app(_deps(chat_agent=None))
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/chat", json={"session_id": "s1", "message": "hi"}
+        )
+    assert resp.status_code == 503
+
+
+async def test_chat_rejects_blank_message():
+    app = build_web_app(_deps(chat_agent=FakeChatAgent()))
+    async with _client(app) as client:
+        resp = await client.post("/api/chat", json={"session_id": "s1", "message": "  "})
+    assert resp.status_code == 400
+
+
 # --- co-hosted server lifecycle ------------------------------------------- #
 
 

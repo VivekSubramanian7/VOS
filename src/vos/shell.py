@@ -614,6 +614,7 @@ async def run() -> None:
     web_task = web_server = None
     if settings.vos_kiosk_enabled:
         from vos.web.app import KioskDeps, build_web_app, start_server
+        from vos.web.chat_agent import KitchenChat
         from vos.web.stt import FasterWhisperTranscriber
 
         kiosk_app = build_web_app(
@@ -625,6 +626,14 @@ async def run() -> None:
                 transcriber=FasterWhisperTranscriber(settings.vos_whisper_model),
                 budget=budget,
                 cassette=cassette,
+                chat_agent=KitchenChat(
+                    model,
+                    graph,
+                    model_name=settings.vos_model,
+                    cassette=cassette,
+                    budget=budget,
+                    session_ttl_s=settings.vos_kiosk_session_ttl_s,
+                ),
                 pin=(
                     settings.vos_kiosk_pin.get_secret_value()
                     if settings.vos_kiosk_pin
