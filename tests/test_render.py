@@ -455,6 +455,19 @@ def test_search_shows_both_kinds():
     assert "from a video" in out and "from x" in out
 
 
+def test_a_loose_search_says_it_widened():
+    """Results that don't contain every word are fine; not saying so is what made the
+    old /search feel broken."""
+    notes = [_note_view("from a video", 10)]
+
+    strict = render_search(notes, [], "gravity waves")
+    loose = render_search(notes, [], "gravity waves", loose=True)
+
+    assert "Nothing has all of those words" in loose
+    assert "Nothing has all of those words" not in strict
+    assert "gravity waves" in loose
+
+
 def test_search_omits_a_group_that_found_nothing():
     out = render_search([], [_post_view("from x")], "term")
     assert "from x" in out

@@ -26,6 +26,7 @@ from vos.contracts import (
     Classification,
     ExtractedEntity,
     GraphStats,
+    MatchMode,
     PulseArtifact,
     PulseDigest,
     PulsePost,
@@ -87,6 +88,19 @@ class FakeCommand:
         self.args = args
 
 
+def _matches(term: str, text: str, match: MatchMode) -> bool:
+    """Substring stand-in for the fulltext index.
+
+    Crude on purpose — the analyzer's real behaviour belongs in the integration tests.
+    What it does model faithfully is the one thing the shell depends on: `all` means
+    every word, `any` means one is enough. Without that distinction the two-step
+    fallback in cmd_search would pass its tests whichever mode it asked for.
+    """
+    words = term.lower().split()
+    hits = (word in text.lower() for word in words)
+    return all(hits) if match == "all" else any(hits)
+
+
 class FakeGraph:
     """In-memory stand-in for the Neo4j projection."""
 
@@ -143,9 +157,13 @@ class FakeGraph:
             if e.get("classification") and e["classification"].category == category
         ][:n]
 
-    async def search(self, term: str, n: int = 10) -> list[ThoughtView]:
+    async def search(
+        self, term: str, n: int = 10, *, match: MatchMode = "all"
+    ) -> list[ThoughtView]:
         return [
-            self._view(e) for e in self.thoughts.values() if term in e["record"].text
+            self._view(e)
+            for e in self.thoughts.values()
+            if _matches(term, e["record"].text, match)
         ][:n]
 
     async def pending(self) -> list[ThoughtView]:
@@ -184,7 +202,7 @@ class FakeGraph:
         self.notes[video_id] = list(notes)
         return len(notes)
 
-    async def search_notes(self, term: str, n: int = 10):
+    async def search_notes(self, term: str, n: int = 10, *, match: MatchMode = "all"):
         # State-aware like notes_for_video, so /notes has something real to find —
         # otherwise a test asserting both groups of a search result is unwritable.
         from uuid import uuid4
@@ -204,7 +222,7 @@ class FakeGraph:
             )
             for video_id, notes in self.notes.items()
             for note in notes
-            if term in note.text
+            if _matches(term, note.text, match)
         ]
         return matches[:n]
 
@@ -237,12 +255,12 @@ class FakeGraph:
                 return [self._post_view(p, digest) for p in digest.posts]
         return []
 
-    async def search_posts(self, term: str, n: int = 10):
+    async def search_posts(self, term: str, n: int = 10, *, match: MatchMode = "all"):
         matches = [
             self._post_view(p, digest)
             for digest in self.pulses.values()
             for p in digest.posts
-            if term in p.text or term in p.author_handle
+            if _matches(term, f"{p.text} {p.author_handle}", match)
         ]
         return matches[:n]
 
@@ -482,6 +500,45 @@ async def test_search_without_argument_shows_usage(bot: VosBot):
     m = FakeMessage()
     await bot.cmd_search(m, FakeCommand(None))  # type: ignore[arg-type]
     assert "Usage" in m.last
+
+
+async def _two_thoughts(bot: VosBot) -> None:
+    await bot.capture(FakeMessage("planning a trip to rome", 1))  # type: ignore[arg-type]
+    await bot.capture(FakeMessage("buy bananas", 2))  # type: ignore[arg-type]
+
+
+async def test_search_prefers_the_strict_match(bot: VosBot):
+    """Both words present, so the fallback must not run and the heading stays plain."""
+    await _two_thoughts(bot)
+
+    m = FakeMessage()
+    await bot.cmd_search(m, FakeCommand("trip rome"))  # type: ignore[arg-type]
+
+    assert "planning a trip to rome" in m.last
+    assert "buy bananas" not in m.last
+    assert "Nothing has all" not in m.last
+
+
+async def test_search_falls_back_and_says_so(bot: VosBot):
+    """No thought has both words. Widening is fine; doing it silently is the bug."""
+    await _two_thoughts(bot)
+
+    m = FakeMessage()
+    await bot.cmd_search(m, FakeCommand("rome bananas"))  # type: ignore[arg-type]
+
+    assert "planning a trip to rome" in m.last
+    assert "buy bananas" in m.last
+    assert "Nothing has all of those words" in m.last
+
+
+async def test_a_single_word_miss_does_not_fall_back(bot: VosBot):
+    """There is nothing to relax in one word — "any" of it is the same search."""
+    await _two_thoughts(bot)
+
+    m = FakeMessage()
+    await bot.cmd_search(m, FakeCommand("kumquats"))  # type: ignore[arg-type]
+
+    assert m.last == "No matches."
 
 
 async def test_category_rejects_unknown_name(bot: VosBot):

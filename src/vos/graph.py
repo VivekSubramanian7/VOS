@@ -22,6 +22,7 @@ from vos.contracts import (
     CaptureRecord,
     Classification,
     GraphStats,
+    MatchMode,
     NoteView,
     PostView,
     PulseDigest,
@@ -49,15 +50,62 @@ SCHEMA: tuple[str, ...] = (
     "FOR (e:Entity) REQUIRE e.canonical_name IS UNIQUE",
     "CREATE INDEX thought_created IF NOT EXISTS FOR (t:Thought) ON (t.created_at)",
     "CREATE INDEX thought_status IF NOT EXISTS FOR (t:Thought) ON (t.status)",
-    "CREATE FULLTEXT INDEX thought_text IF NOT EXISTS "
-    "FOR (t:Thought) ON EACH [t.text, t.title, t.summary]",
     "CREATE CONSTRAINT video_id IF NOT EXISTS FOR (v:Video) REQUIRE v.id IS UNIQUE",
     "CREATE CONSTRAINT note_id IF NOT EXISTS FOR (n:Note) REQUIRE n.id IS UNIQUE",
-    "CREATE FULLTEXT INDEX note_text IF NOT EXISTS FOR (n:Note) ON EACH [n.text]",
     "CREATE CONSTRAINT pulse_id IF NOT EXISTS FOR (p:Pulse) REQUIRE p.id IS UNIQUE",
     "CREATE CONSTRAINT post_id IF NOT EXISTS FOR (p:Post) REQUIRE p.id IS UNIQUE",
-    "CREATE FULLTEXT INDEX post_text IF NOT EXISTS FOR (p:Post) ON EACH [p.text]",
+    # The fulltext indexes replace an earlier set (thought_text/note_text/post_text)
+    # built on Neo4j's default analyzer, `standard-no-stop-words`, which — as the name
+    # says — filters nothing. That made "to", "a" and "the" ordinary search terms, so
+    # any phrase containing one matched most of the graph. `english` filters Lucene's
+    # standard English stop words *and* stems, so "banana" finds "bananas".
+    #
+    # An analyzer cannot be changed in place and `IF NOT EXISTS` will not replace an
+    # existing index, hence the drop-and-rename. New names are what make this
+    # idempotent: after the first run the DROP is a no-op and the CREATE is skipped,
+    # with nothing to inspect and no decision to get wrong. Nothing is lost either —
+    # a fulltext index is derived state, repopulated from the nodes on creation.
+    "DROP INDEX thought_text IF EXISTS",
+    "DROP INDEX note_text IF EXISTS",
+    "DROP INDEX post_text IF EXISTS",
+    "CREATE FULLTEXT INDEX thought_search IF NOT EXISTS "
+    "FOR (t:Thought) ON EACH [t.text, t.title, t.summary] "
+    "OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}",
+    "CREATE FULLTEXT INDEX note_search IF NOT EXISTS "
+    "FOR (n:Note) ON EACH [n.text] "
+    "OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}",
+    "CREATE FULLTEXT INDEX post_search IF NOT EXISTS "
+    "FOR (p:Post) ON EACH [p.text] "
+    "OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}",
 )
+
+# Characters Lucene's query parser treats as syntax. Escaped wholesale, so the only
+# operators in a query are the ones `_lucene_query` puts there.
+_LUCENE_SPECIAL = frozenset(r'+-&|!(){}[]^"~*?:\/')
+
+
+def _lucene_query(term: str, *, match: MatchMode = "all") -> str | None:
+    """Turn what the user typed into a Lucene query.
+
+    `db.index.fulltext.queryNodes` takes a query *language*, not a phrase. Passing the
+    raw term through meant `*` searched for everything, `(` was a syntax error that
+    surfaced as an unhandled exception, and — worst because it looked like it worked —
+    words were OR-ed, so `trip to rome` returned every thought containing "to".
+
+    Stop words need no handling here: the `english` analyzer strips them from the query
+    as well as from the index, which is the whole reason for using it. A term made only
+    of stop words therefore matches nothing, and that is the honest answer.
+
+    Returns None when nothing searchable is left, so callers can skip the round trip.
+    """
+    tokens = [
+        "".join("\\" + c if c in _LUCENE_SPECIAL else c for c in word)
+        for word in term.split()
+    ]
+    if not tokens:
+        return None
+    prefix = "+" if match == "all" else ""
+    return " ".join(prefix + token for token in tokens)
 
 
 def _native(value: Any) -> Any:
@@ -141,6 +189,11 @@ class Neo4jGraph:
         """Idempotent; safe to run on every startup."""
         for statement in SCHEMA:
             await self._run(statement)
+        # Index population is asynchronous. Without this wait, the first search after a
+        # fulltext index is (re)created runs against a half-built index and quietly
+        # returns too little — a wrong answer that looks like a real one. Milliseconds
+        # once the indexes are already online, which is every startup but the first.
+        await self._run("CALL db.awaitIndexes(300)")
         await self._seed_categories()
 
     async def _seed_categories(self) -> None:
@@ -393,16 +446,27 @@ class Neo4jGraph:
         )
         return [_to_view(r) for r in rows]
 
-    async def search(self, term: str, n: int = 10) -> list[ThoughtView]:
+    async def search(
+        self, term: str, n: int = 10, *, match: MatchMode = "all"
+    ) -> list[ThoughtView]:
+        """Thoughts matching every word typed (`match='all'`), or any of them.
+
+        `queryNodes` yields in descending relevance, so `LIMIT` keeps the best n; the
+        trailing sort then shows those newest-first, the way /recent and /category do.
+        Relevance decides *which* thoughts come back, recency decides how they read.
+        """
+        query = _lucene_query(term, match=match)
+        if query is None:
+            return []
         rows = await self._run(
             f"""
-            CALL db.index.fulltext.queryNodes('thought_text', $term) YIELD node AS t
+            CALL db.index.fulltext.queryNodes('thought_search', $term) YIELD node AS t
             WHERE t.status <> 'deleted'
             WITH t LIMIT $n
             {self._VIEW}
             ORDER BY created_at DESC
             """,
-            term=term,
+            term=query,
             n=n,
         )
         return [_to_view(r) for r in rows]
@@ -606,17 +670,22 @@ class Neo4jGraph:
         )
         return [_to_note(r) for r in rows]
 
-    async def search_notes(self, term: str, n: int = 10) -> list[NoteView]:
+    async def search_notes(
+        self, term: str, n: int = 10, *, match: MatchMode = "all"
+    ) -> list[NoteView]:
+        query = _lucene_query(term, match=match)
+        if query is None:
+            return []
         rows = await self._run(
             """
-            CALL db.index.fulltext.queryNodes('note_text', $term) YIELD node AS note
+            CALL db.index.fulltext.queryNodes('note_search', $term) YIELD node AS note
             MATCH (note)-[:FROM]->(v:Video)
             RETURN note.id AS id, note.text AS text, note.t_seconds AS t,
                    note.section AS section, note.score AS score,
                    v.id AS video_id, v.title AS title, v.url AS url
             LIMIT $n
             """,
-            term=term,
+            term=query,
             n=n,
         )
         return [_to_note(r) for r in rows]
@@ -694,15 +763,20 @@ class Neo4jGraph:
         )
         return [_to_post(r) for r in rows]
 
-    async def search_posts(self, term: str, n: int = 10) -> list[PostView]:
+    async def search_posts(
+        self, term: str, n: int = 10, *, match: MatchMode = "all"
+    ) -> list[PostView]:
+        query = _lucene_query(term, match=match)
+        if query is None:
+            return []
         rows = await self._run(
             f"""
-            CALL db.index.fulltext.queryNodes('post_text', $term) YIELD node AS n
+            CALL db.index.fulltext.queryNodes('post_search', $term) YIELD node AS n
             MATCH (p:Pulse)-[:HAS_POST]->(n)
             {self._POST_VIEW}
             LIMIT $n
             """,
-            term=term,
+            term=query,
             n=n,
         )
         return [_to_post(r) for r in rows]

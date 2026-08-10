@@ -409,13 +409,24 @@ def render_all_posts(posts: list[PostView]) -> str:
     return "\n".join(lines)
 
 
-def render_search(notes: list[NoteView], posts: list[PostView], term: str) -> str:
+def render_search(
+    notes: list[NoteView], posts: list[PostView], term: str, *, loose: bool = False
+) -> str:
     """`/notes` across both stores. A group that found nothing is omitted rather than
-    shown empty — an empty heading reads as a broken feature."""
+    shown empty — an empty heading reads as a broken feature.
+
+    `loose` means the caller fell back to matching any word rather than all of them.
+    It changes only the heading, but that heading is the difference between a widened
+    search and one that looks like it ignored the term.
+    """
     if not notes and not posts:
         return "No notes match that."
 
-    lines = [f"<b>Matching “{escape(term)}”</b>"]
+    lines = [
+        f"<b>Nothing has all of those words. Anything matching “{escape(term)}”</b>"
+        if loose
+        else f"<b>Matching “{escape(term)}”</b>"
+    ]
     if notes:
         lines.append("\n<b>From videos</b>")
         for note in notes:
@@ -508,7 +519,7 @@ Just type. Anything you send that isn't a command is captured.
 <b>Reading back</b>
 /recent [n] — latest thoughts
 /category &lt;name&gt; — thoughts in one category
-/search &lt;term&gt; — full-text search
+/search &lt;term&gt; — thoughts containing every word you type
 /stats — counts, top sources, spend
 
 <b>Fixing</b>

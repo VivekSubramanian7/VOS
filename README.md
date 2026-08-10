@@ -33,7 +33,7 @@ uv run vos-bot                # long-polling; no public URL needed
 | Command | Does |
 |---|---|
 | *(any text)* | Capture a thought |
-| `/recent [n]` · `/category <name>` · `/search <term>` | Read back |
+| `/recent [n]` · `/category <name>` · `/search <term>` | Read back — `/search` wants every word, and matches word endings |
 | `/undo` | Soft-delete the last thought |
 | `/pending` | Retry thoughts whose classification failed |
 | `/stats` | Counts per category, most-referenced sources, spend |
