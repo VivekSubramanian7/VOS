@@ -1,5 +1,5 @@
 # VOS pull-based auto-deploy. Registered as a Task Scheduler job on the server
-# (every 5 minutes, run as the signed-in user — docker needs that session).
+# (every 5 minutes, run as the signed-in user - docker needs that session).
 # Polls origin/main and rebuilds only when there are new commits; no webhooks,
 # no inbound ports (ADR-003). See DEPLOY.md for setup and rationale.
 
@@ -9,7 +9,7 @@ Set-Location $repo
 git fetch --quiet origin main
 $local  = git rev-parse HEAD
 $remote = git rev-parse origin/main
-if ($local -eq $remote) { exit 0 }   # nothing new — silent no-op
+if ($local -eq $remote) { exit 0 }   # nothing new - silent no-op
 
 $log = Join-Path $PSScriptRoot "deploy.log"
 "$(Get-Date -Format s) deploying $remote" | Add-Content $log
@@ -17,7 +17,7 @@ $log = Join-Path $PSScriptRoot "deploy.log"
 # --ff-only: a diverged server checkout halts loudly instead of merging.
 git pull --ff-only origin main *>> $log
 if ($LASTEXITCODE -eq 0) {
-    # Builds the new image BEFORE swapping containers — a broken build leaves
+    # Builds the new image BEFORE swapping containers - a broken build leaves
     # the old version running untouched.
     docker compose up -d --build *>> $log
 }

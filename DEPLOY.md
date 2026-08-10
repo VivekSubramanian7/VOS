@@ -30,6 +30,23 @@ For future reference (server-to-server moves, backups), the general rules:
 
 ## 1. Server bootstrap
 
+**Scripted path:** `deploy/bootstrap-server.ps1` automates this whole section —
+tool installs (winget), tailnet join, clone, `.env` validation, build, Neo4j
+first start, smoke test, `tailscale serve`, and the auto-deploy task. It is
+idempotent (re-run after reboots or failures) and never starts the bot; the
+cutover is a separate explicit `-Cutover` flag so a second Telegram poller can
+never start by accident. In an elevated PowerShell on the server:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+C:\VOS\deploy\bootstrap-server.ps1            # bootstrap (repeat until clean)
+C:\VOS\deploy\bootstrap-server.ps1 -Cutover   # only after stopping the dev bot
+```
+
+Two things stay manual: Autologon (§1.1.5) and the tablet repoint (§2).
+The subsections below document what the script does, and serve as the manual
+fallback.
+
 ### 1.1 Docker Desktop (WSL2 backend)
 
 1. Verify virtualization is enabled (Task Manager → Performance → CPU). Enable in BIOS/UEFI if not.
