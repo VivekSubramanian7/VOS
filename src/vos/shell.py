@@ -543,7 +543,16 @@ class VosBot:
         term = command.args.strip()
         notes = await self.graph.search_notes(term, 10)
         posts = await self.graph.search_posts(term, 10)
-        await _send(message.answer, render_search(notes, posts, term))
+
+        # Both stores together decide: a strict hit in either one is a better answer
+        # than a loose sweep of both.
+        loose = False
+        if not notes and not posts and len(term.split()) > 1:
+            notes = await self.graph.search_notes(term, 10, match="any")
+            posts = await self.graph.search_posts(term, 10, match="any")
+            loose = bool(notes or posts)
+
+        await _send(message.answer, render_search(notes, posts, term, loose=loose))
 
     async def requeue_unprocessed_videos(
         self, answer: Callable[[str], Awaitable[Any]]
@@ -593,11 +602,20 @@ class VosBot:
         if not command.args:
             await message.answer("Usage: <code>/search oat milk</code>")
             return
-        views = await self.graph.search(command.args.strip(), 20)
-        await _send(
-            message.answer,
-            render_thoughts(views, f"Matches for “{command.args.strip()}”", "No matches."),
-        )
+        term = command.args.strip()
+        views = await self.graph.search(term, 20)
+        heading = f"Matches for “{term}”"
+
+        # Widen only when the strict search found nothing and there is something to
+        # relax — one word is already as loose as it gets. Saying so in the heading is
+        # what separates a fallback from the bug this replaced: results that don't
+        # contain everything you typed are fine, silently pretending they do is not.
+        if not views and len(term.split()) > 1:
+            views = await self.graph.search(term, 20, match="any")
+            if views:
+                heading = f"Nothing has all of those words. Anything matching “{term}”"
+
+        await _send(message.answer, render_thoughts(views, heading, "No matches."))
 
     async def cmd_undo(self, message: Message) -> None:
         last = self.journal.last_capture()

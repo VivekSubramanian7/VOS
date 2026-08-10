@@ -60,6 +60,13 @@ classified  — enrichment succeeded
 unclassified— enrichment failed; retryable via /pending. Never dropped.
 deleted     — soft-deleted by /undo; the journal line is never edited"""
 
+MatchMode = Literal["all", "any"]
+"""How a search treats the words in a term.
+
+all — every word must appear. The default, and the only defensible one: a search that
+      silently widens looks exactly like a search that ignores what was typed.
+any — one word is enough. Reserved for a fallback the caller has told the user about."""
+
 
 # Fixed namespace for deterministic thought IDs. Changing this value would orphan
 # every existing thought, so it is a constant, not configuration.
@@ -470,7 +477,12 @@ class GraphStore(Protocol):
     async def mark_unclassified(self, id: UUID, error: str) -> None: ...
     async def recent(self, n: int = 10) -> list[ThoughtView]: ...
     async def by_category(self, category: str, n: int = 10) -> list[ThoughtView]: ...
-    async def search(self, term: str, n: int = 10) -> list[ThoughtView]: ...
+    # `match` decides whether every word must appear or any one will do. It has a
+    # default because strict is the only sensible one: a search that quietly widens
+    # is indistinguishable from a search that ignores what was typed.
+    async def search(
+        self, term: str, n: int = 10, *, match: MatchMode = "all"
+    ) -> list[ThoughtView]: ...
     async def last_thought_id(self) -> UUID | None: ...
     async def soft_delete(self, id: UUID) -> None: ...
     async def stats(self) -> GraphStats: ...

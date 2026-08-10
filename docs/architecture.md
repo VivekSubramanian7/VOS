@@ -220,7 +220,7 @@ class GraphStore(Protocol):
     async def upsert_thought(self, r: CaptureRecord, c: Classification | None) -> None: ...
     async def recent(self, n: int) -> list[ThoughtView]: ...
     async def by_category(self, c: Category, n: int) -> list[ThoughtView]: ...
-    async def search(self, term: str, n: int) -> list[ThoughtView]: ...
+    async def search(self, term: str, n: int, *, match: MatchMode) -> list[ThoughtView]: ...
     async def delete_thought(self, id: UUID) -> None: ...
     async def stats(self) -> GraphStats: ...
     async def follow(self, s: SourceRef) -> None: ...
@@ -315,7 +315,7 @@ retries, and an FSM for multi-step `/follow` and confirmation flows.
 | *(voice note)* | Explicit "voice isn't wired up yet" reply — never a silent drop |
 | `/recent [n]` | Last *n* thoughts |
 | `/category <name>` | Thoughts in a category |
-| `/search <term>` | Full-text search |
+| `/search <term>` | Thoughts containing every word; widens to any word, labelled, if that finds nothing |
 | `/undo` | Soft-delete the last thought |
 | `/stats` | Counts per category + most-referenced sources |
 | `/pending` | Thoughts that failed classification, with retry |
@@ -395,12 +395,28 @@ CREATE CONSTRAINT category_nm  IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS 
 CREATE CONSTRAINT entity_canon IF NOT EXISTS FOR (e:Entity)   REQUIRE e.canonical_name IS UNIQUE;
 CREATE INDEX     thought_time  IF NOT EXISTS FOR (t:Thought)  ON (t.created_at);
 CREATE INDEX     thought_stat  IF NOT EXISTS FOR (t:Thought)  ON (t.status);
-CREATE FULLTEXT INDEX thought_text IF NOT EXISTS
-  FOR (t:Thought) ON EACH [t.text, t.title, t.summary];
+CREATE FULLTEXT INDEX thought_search IF NOT EXISTS
+  FOR (t:Thought) ON EACH [t.text, t.title, t.summary]
+  OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}};
 ```
 
 The uniqueness constraints are what make `MERGE` idempotent under retry; they are correctness
 infrastructure, not tuning.
+
+**The analyzer is load-bearing.** Neo4j's default, `standard-no-stop-words`, filters no stop
+words, so `to`, `a` and `the` were ordinary search terms — and since `queryNodes` OR-s terms,
+any phrase containing one matched most of the graph. `english` filters Lucene's standard
+English stop words and stems, so `banana` finds "bananas". An analyzer cannot be changed in
+place and `IF NOT EXISTS` will not replace an existing index, so `SCHEMA` drops the older
+`thought_text` / `note_text` / `post_text` names before creating these; new names are what
+make that idempotent across restarts. Nothing is lost — a fulltext index is derived state,
+repopulated from the nodes on creation. `ensure_schema` then waits on `db.awaitIndexes`,
+because population is asynchronous and a search against a half-built index returns a wrong
+answer that looks like a real one.
+
+The other half of the fix lives in `graph._lucene_query`: `queryNodes` takes a Lucene query
+*language*, not a phrase, so the user's words are escaped and each is marked required. Passing
+the term through raw meant `*` matched everything and `(` raised out of the handler.
 
 ### 7.3 Storage layout
 

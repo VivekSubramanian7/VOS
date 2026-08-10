@@ -264,6 +264,119 @@ async def test_search_finds_by_text(graph: Neo4jGraph):
     assert [v.text for v in views] == ["oat milk and bananas"]
 
 
+# --- search: what the term is actually allowed to match --------------------- #
+#
+# The bug these cover: `/search trip to rome` returned 10 of 12 live thoughts. The one
+# test above passed throughout, because a single distinctive word is the only case the
+# old code got right.
+
+
+async def test_search_requires_every_word(graph: Neo4jGraph):
+    """The reported symptom. "to" must not drag in everything that says "to"."""
+    await graph.upsert_thought(_record(1, text="planning a trip to rome"), _classification())
+    await graph.upsert_thought(_record(2, text="I need to walk 5 kilometers"), _classification())
+    await graph.upsert_thought(_record(3, text="my current weight"), _classification())
+
+    views = await graph.search("trip to rome")
+
+    assert [v.text for v in views] == ["planning a trip to rome"]
+
+
+async def test_search_ignores_stop_words(graph: Neo4jGraph):
+    """Requiring "the" would be as wrong as OR-ing it — this thought never says it.
+
+    Nothing in VOS filters stop words; the `english` analyzer strips them from the
+    query and the index alike.
+    """
+    await graph.upsert_thought(_record(1, text="need to buy bananas"), _classification())
+
+    views = await graph.search("the bananas")
+
+    assert [v.text for v in views] == ["need to buy bananas"]
+
+
+async def test_search_matches_word_endings(graph: Neo4jGraph):
+    """Stemming, which is why the analyzer switch replaced a wildcard-prefix hack:
+    Lucene does not analyse wildcard terms, so `banana*` would miss the stem."""
+    await graph.upsert_thought(_record(1, text="buy bananas"), _classification())
+
+    assert [v.text for v in await graph.search("banana")] == ["buy bananas"]
+    assert [v.text for v in await graph.search("bananas")] == ["buy bananas"]
+
+
+async def test_a_wildcard_matches_nothing(graph: Neo4jGraph):
+    """`*` used to return the entire graph."""
+    await graph.upsert_thought(_record(1, text="oat milk"), _classification())
+
+    assert await graph.search("*") == []
+
+
+async def test_lucene_syntax_does_not_raise(graph: Neo4jGraph):
+    """`(` used to raise a ClientError out of the handler, so the user got no reply."""
+    await graph.upsert_thought(_record(1, text="oat milk"), _classification())
+
+    for term in ("(", "]", "a && b", 'unclosed "quote', "C++"):
+        assert await graph.search(term) == []
+
+
+async def test_an_empty_term_never_reaches_the_database(graph: Neo4jGraph):
+    await graph.upsert_thought(_record(1, text="oat milk"), _classification())
+
+    assert await graph.search("   ") == []
+
+
+async def test_only_stop_words_matches_nothing(graph: Neo4jGraph):
+    """It analyses down to an empty query. "No matches" is the honest answer for a
+    word that carries no meaning — and it must not error."""
+    await graph.upsert_thought(_record(1, text="the oat milk"), _classification())
+
+    assert await graph.search("the") == []
+
+
+async def test_any_mode_widens_to_a_single_word(graph: Neo4jGraph):
+    """The labelled fallback: no thought has both words, so each match on its own."""
+    await graph.upsert_thought(_record(1, text="trip to rome", minutes=1), _classification())
+    await graph.upsert_thought(_record(2, text="buy bananas", minutes=2), _classification())
+
+    assert await graph.search("rome bananas") == []
+    assert {v.text for v in await graph.search("rome bananas", match="any")} == {
+        "trip to rome",
+        "buy bananas",
+    }
+
+
+async def test_search_notes_requires_every_word(graph: Neo4jGraph):
+    """`/notes` shares the defect and the fix."""
+    await graph.upsert_video(_meta())
+    await graph.replace_notes(
+        "dQw4w9WgXcQ",
+        [_note("light cannot be measured one way", 10), _note("clocks drift apart", 20)],
+    )
+
+    assert [n.text for n in await graph.search_notes("clocks drift")] == ["clocks drift apart"]
+    assert await graph.search_notes("*") == []
+    assert len(await graph.search_notes("the")) == 0
+
+
+async def test_the_fulltext_indexes_use_the_english_analyzer(graph: Neo4jGraph):
+    """And re-running the schema does not duplicate or revert them.
+
+    `ensure_schema` drops the old index names and creates new ones, which is only safe
+    because it is a no-op the second time round — it runs on every startup.
+    """
+    await graph.ensure_schema()
+
+    rows = await graph._run(
+        "SHOW INDEXES YIELD name, type, options, state WHERE type = 'FULLTEXT' "
+        "RETURN name, options, state ORDER BY name"
+    )
+
+    assert [r["name"] for r in rows] == ["note_search", "post_search", "thought_search"]
+    for row in rows:
+        assert row["options"]["indexConfig"]["fulltext.analyzer"] == "english"
+        assert row["state"] == "ONLINE"
+
+
 async def test_soft_delete_hides_but_does_not_remove(graph: Neo4jGraph):
     record = _record()
     await graph.upsert_thought(record, _classification())
