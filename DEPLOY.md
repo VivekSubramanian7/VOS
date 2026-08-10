@@ -1,0 +1,185 @@
+# Deploying VOS to a Windows server
+
+Full docker-compose (Neo4j + app in containers) on a Windows machine, with the
+kiosk reachable only over the tailnet (`tailscale serve` → loopback port 8765,
+per ADR-015 — never open a firewall port for this).
+
+The invariant that shapes every step: **`journal/` is the source of truth**.
+Neo4j and `shopping.db` are disposable projections that rebuild from it. And
+**Telegram long-polling is exclusive** — at any instant exactly one machine may
+run the bot, or both fight over `getUpdates` with 409 Conflict.
+
+## What migrates vs what rebuilds
+
+| Item | Migrate? | Why |
+|---|---|---|
+| `.env` | Yes | Secrets, not derivable. Git-ignored — travels out-of-band. |
+| `journal/` | Yes | Source of truth. |
+| `artifacts/` | Yes | Video transcripts are NOT recomputable. |
+| `cassettes/` | Optional | Tiny; keeps `/stats` spend history and eval replay. |
+| Neo4j volume | No | Startup reprojection restores thoughts (uncategorized, into `/pending`); `vos reclassify --rebuild` restores categories via model calls. |
+| `shopping.db*` | No | Replays from the journal on startup; lives at `/data/shopping.db` on a named volume under compose. |
+| HF whisper cache | No | Re-downloads once (~250 MB) into the `hf-cache` volume on first mic use. |
+
+## 1. Server bootstrap
+
+### 1.1 Docker Desktop (WSL2 backend)
+
+1. Verify virtualization is enabled (Task Manager → Performance → CPU). Enable in BIOS/UEFI if not.
+2. `wsl --install --no-distribution` (or `wsl --update`), reboot if prompted.
+3. Install Docker Desktop; keep "Use WSL 2 based engine" checked. Docker Hub sign-in not needed.
+4. Settings → General → enable **Start Docker Desktop when you sign in**.
+5. **Reboot gotcha:** Docker Desktop only runs inside a logged-in session. After
+   a Windows Update reboot the containers stay down until someone signs in.
+   Fix: configure auto-logon with Sysinternals
+   [Autologon](https://learn.microsoft.com/en-us/sysinternals/downloads/autologon)
+   (stores the password encrypted, unlike the netplwiz registry route). A bot
+   that silently dies on Patch Tuesday defeats the purpose of the server.
+6. Confirm: `docker run --rm hello-world`.
+
+### 1.2 Tailscale
+
+1. Install from tailscale.com, sign in to the **same tailnet the tablet is on**.
+2. Admin console → DNS: confirm MagicDNS and HTTPS Certificates are enabled.
+3. Note the server's FQDN from `tailscale status` (e.g. `server.tailnet.ts.net`).
+
+Tailscale runs as a Windows service — connectivity and `serve` config survive
+reboots without a user session.
+
+### 1.3 Clone and transfer data
+
+```powershell
+git clone https://github.com/VivekSubramanian7/VOS.git C:\VOS
+```
+
+`.env`, `journal/`, `artifacts/`, `cassettes/` are git-ignored — move them via
+Taildrop. On the dev machine:
+
+```powershell
+Compress-Archive -Path .env, journal, artifacts, cassettes -DestinationPath $env:TEMP\vos-migration.zip
+tailscale file cp $env:TEMP\vos-migration.zip <server-hostname>:
+Remove-Item $env:TEMP\vos-migration.zip    # contains the bot token + API keys
+```
+
+On the server:
+
+```powershell
+tailscale file get C:\VOS\
+Expand-Archive C:\VOS\vos-migration.zip -DestinationPath C:\VOS\
+Remove-Item C:\VOS\vos-migration.zip
+```
+
+Do NOT copy `shopping.db*` or any Neo4j data — see the table above.
+
+### 1.4 Finalize `.env` — before the first Neo4j start
+
+Neo4j bakes `NEO4J_AUTH` into its data volume on FIRST start; changing the
+password later requires `docker compose down -v`. So settle `.env` now:
+
+- Carried over unchanged: `TELEGRAM_BOT_TOKEN`, `VOS_ALLOWED_USER_ID`,
+  `NEO4J_PASSWORD`, the model provider key, `VOS_MODEL`.
+- Add: `VOS_KIOSK_ENABLED=1`, `VOS_KIOSK_PIN=<choose one>`.
+- Do NOT set `VOS_KIOSK_HOST` or `VOS_SHOPPING_DB` — docker-compose.yml owns
+  those in-container values.
+
+### 1.5 Build and start Neo4j only
+
+```powershell
+cd C:\VOS
+docker compose build
+docker compose up -d neo4j
+docker compose ps          # wait for (healthy), up to ~2 min
+docker compose run --rm --no-deps app python -c "import vos.shell; import vos.web.app; import faster_whisper; print('kiosk deps ok')"
+```
+
+**Do not `docker compose up -d app` yet** — the dev machine is still polling
+Telegram. The smoke-test line starts no poller and needs no database.
+
+### 1.6 Publish the kiosk on the tailnet
+
+```powershell
+tailscale serve --bg http://127.0.0.1:8765
+tailscale serve status     # https://<server>.<tailnet>.ts.net -> 127.0.0.1:8765
+```
+
+This terminates HTTPS with a real `*.ts.net` certificate (required for Chrome
+mic access) and persists across reboots. No firewall changes — ever.
+
+### 1.7 Register the auto-deploy task
+
+```powershell
+Register-ScheduledTask -TaskName "VOS deploy" `
+  -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)) `
+  -Action (New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\VOS\deploy\pull-deploy.ps1")
+```
+
+Leave the default "Run only when user is logged on" — the docker CLI needs the
+session Docker Desktop lives in (covered by Autologon, §1.1.5).
+
+After this, deployment is: push to GitHub from the dev machine; within 5
+minutes the server pulls, rebuilds, and restarts. `deploy/pull-deploy.ps1`
+only acts when `origin/main` has new commits, pulls `--ff-only` (a diverged
+checkout halts loudly), and builds the image *before* swapping containers — a
+broken push leaves the old version running and pings the Telegram chat.
+`deploy/deploy.log` shows what happened; `git log -1` shows what's live.
+
+Rejected alternatives: webhook receiver (inbound exposure violates ADR-003),
+Watchtower (registry-based; this repo builds locally), GitHub Actions
+self-hosted runner (fine but more machinery than one personal server needs).
+
+## 2. Cutover
+
+1. **Stop the dev bot FIRST** — kill any `uv run vos-bot` and
+   `docker compose stop app` on the dev machine. Do NOT `down -v` there: the
+   dev Neo4j volume is the rollback state.
+2. Server: `docker compose up -d app; docker compose logs -f app`. Expect
+   journal reprojection lines, shopping mark replay, and
+   `Kiosk serving on 0.0.0.0:8765`. A Telegram 409 means the dev bot still runs.
+3. Restore graph categories (reprojection restores *presence* only — everything
+   lands in `/pending` uncategorized):
+   ```powershell
+   docker compose exec app vos reclassify --rebuild
+   ```
+   One model call per journal record. For a large journal, bound spend with
+   `--from`, or expect the daily budget to defer the tail to `/pending`.
+4. Tablet: browse to `https://<server>.<tailnet>.ts.net`, enter the PIN,
+   re-grant mic (permission is per-origin), re-pin to home screen.
+5. Dev machine hygiene: `tailscale serve reset` so the old URL goes dark.
+
+### Verification checklist
+
+- [ ] `docker compose ps` — both Up, neo4j (healthy)
+- [ ] `docker compose logs app` — no tracebacks, no Telegram 409
+- [ ] Telegram `/stats` responds; a test thought gets *classified* (proves the model key)
+- [ ] Server: `curl.exe http://127.0.0.1:8765/api/health` → 200
+- [ ] Tablet: `https://<server>.<tailnet>.ts.net/api/health` → 200, valid cert
+- [ ] Tablet mic capture end-to-end (first use downloads the whisper model once — watch the logs)
+- [ ] `docker compose restart app`, capture again — no re-download (hf-cache volume works)
+- [ ] Shopping list shows pre-migration items with correct bought states
+- [ ] New journal lines appear in `C:\VOS\journal\` on the host (bind mount = backupable)
+- [ ] **Reboot drill**: reboot now, verify Autologon → Docker → containers → tablet URL
+
+## 3. Rollback
+
+The dev machine keeps a complete pre-cutover copy (data was copied, not moved):
+
+1. Server: `docker compose stop app` (leave neo4j; harmless, preserves a retry).
+2. Taildrop the journal delta back: any `journal/*.jsonl` and new `artifacts/`
+   files changed since cutover. With the dev bot stopped the server files are a
+   strict superset — overwrite the dev copies. (If both machines ever polled
+   simultaneously the files diverge and need a line-wise merge by record id —
+   the "exactly one poller" rule exists to make that impossible.)
+3. Dev: start the bot; startup self-heal reprojects the copied-back records.
+4. If the kiosk matters during the outage, re-run `tailscale serve` on dev and
+   repoint the tablet.
+
+## Operational notes
+
+- Backup = copy `journal/` + `artifacts/` (+ `.env` somewhere safe). Everything
+  else rebuilds.
+- The compose port mapping hardcodes the default `VOS_KIOSK_PORT` (8765) — if
+  you ever change the env var, change the mapping and the `tailscale serve`
+  target with it.
+- Journal writes cross a Windows bind mount (gRPC-FUSE), whose fsync guarantees
+  are weaker than a native filesystem. Acceptable for append-only JSONL: the
+  worst case in a hard host crash is losing the final record.

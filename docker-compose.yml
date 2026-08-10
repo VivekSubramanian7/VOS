@@ -46,13 +46,31 @@ services:
     environment:
       # Inside the compose network Neo4j is reachable by service name.
       NEO4J_URI: bolt://neo4j:7687
+      # The kiosk must bind all container interfaces to be reachable through
+      # the published port below. Exposure on the HOST stays loopback-only via
+      # the 127.0.0.1 port binding — the tailnet is still the perimeter (ADR-015).
+      VOS_KIOSK_HOST: 0.0.0.0
+      # SQLite WAL locking is unreliable over Windows bind mounts (gRPC-FUSE),
+      # and shopping.db is a disposable projection anyway — keep it on a named
+      # volume: nothing to back up, nothing to corrupt.
+      VOS_SHOPPING_DB: /data/shopping.db
+    ports:
+      # Loopback only — reached solely via `tailscale serve` on the host.
+      # Hardcodes the default VOS_KIOSK_PORT; change both together.
+      - "127.0.0.1:8765:8765"
     volumes:
       # The journal is the source of truth — it lives on the host, not in the image.
       - ./journal:/app/journal
       # Transcripts cannot be re-fetched once a video is gone; same treatment.
       - ./artifacts:/app/artifacts
       - ./cassettes:/app/cassettes
+      # Disposable projections and the whisper model cache: named volumes,
+      # Linux-native filesystem, survive container rebuilds.
+      - vos-data:/data
+      - hf-cache:/root/.cache/huggingface
 
 volumes:
   neo4j-data:
   neo4j-logs:
+  vos-data:
+  hf-cache:
