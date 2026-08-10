@@ -11,11 +11,18 @@ run the bot, or both fight over `getUpdates` with 409 Conflict.
 
 ## What migrates vs what rebuilds
 
+**This move is a fresh start**: everything captured so far was testing, so the
+only thing that travels is `.env`. The server begins with an empty journal,
+empty graph, empty shopping list — no reclassify step, no model spend. The dev
+machine keeps the test data untouched.
+
+For future reference (server-to-server moves, backups), the general rules:
+
 | Item | Migrate? | Why |
 |---|---|---|
 | `.env` | Yes | Secrets, not derivable. Git-ignored — travels out-of-band. |
-| `journal/` | Yes | Source of truth. |
-| `artifacts/` | Yes | Video transcripts are NOT recomputable. |
+| `journal/` | Yes* | Source of truth. (*Skipped this move — test data.) |
+| `artifacts/` | Yes* | Video transcripts are NOT recomputable. (*Skipped — test data.) |
 | `cassettes/` | Optional | Tiny; keeps `/stats` spend history and eval replay. |
 | Neo4j volume | No | Startup reprojection restores thoughts (uncategorized, into `/pending`); `vos reclassify --rebuild` restores categories via model calls. |
 | `shopping.db*` | No | Replays from the journal on startup; lives at `/data/shopping.db` on a named volume under compose. |
@@ -46,30 +53,29 @@ run the bot, or both fight over `getUpdates` with 409 Conflict.
 Tailscale runs as a Windows service — connectivity and `serve` config survive
 reboots without a user session.
 
-### 1.3 Clone and transfer data
+### 1.3 Clone and transfer secrets
 
 ```powershell
 git clone https://github.com/VivekSubramanian7/VOS.git C:\VOS
 ```
 
-`.env`, `journal/`, `artifacts/`, `cassettes/` are git-ignored — move them via
-Taildrop. On the dev machine:
+Fresh start: only `.env` travels (it is git-ignored and holds the bot token +
+API keys). Via Taildrop, on the dev machine:
 
 ```powershell
-Compress-Archive -Path .env, journal, artifacts, cassettes -DestinationPath $env:TEMP\vos-migration.zip
-tailscale file cp $env:TEMP\vos-migration.zip <server-hostname>:
-Remove-Item $env:TEMP\vos-migration.zip    # contains the bot token + API keys
+tailscale file cp D:\VOS\.env <server-hostname>:
 ```
 
 On the server:
 
 ```powershell
 tailscale file get C:\VOS\
-Expand-Archive C:\VOS\vos-migration.zip -DestinationPath C:\VOS\
-Remove-Item C:\VOS\vos-migration.zip
 ```
 
-Do NOT copy `shopping.db*` or any Neo4j data — see the table above.
+Do NOT copy `journal/`, `artifacts/`, `cassettes/`, `shopping.db*`, or any
+Neo4j data — the test data stays on the dev machine (see the table above).
+The app creates empty `journal/`, `artifacts/`, `cassettes/` dirs on first run
+(they are also bind-mount targets in compose, which creates them as needed).
 
 ### 1.4 Finalize `.env` — before the first Neo4j start
 
@@ -132,17 +138,13 @@ self-hosted runner (fine but more machinery than one personal server needs).
 1. **Stop the dev bot FIRST** — kill any `uv run vos-bot` and
    `docker compose stop app` on the dev machine. Do NOT `down -v` there: the
    dev Neo4j volume is the rollback state.
-2. Server: `docker compose up -d app; docker compose logs -f app`. Expect
-   journal reprojection lines, shopping mark replay, and
-   `Kiosk serving on 0.0.0.0:8765`. A Telegram 409 means the dev bot still runs.
-3. Restore graph categories (reprojection restores *presence* only — everything
-   lands in `/pending` uncategorized):
-   ```powershell
-   docker compose exec app vos reclassify --rebuild
-   ```
-   One model call per journal record. For a large journal, bound spend with
-   `--from`, or expect the daily budget to defer the tail to `/pending`.
-4. Tablet: browse to `https://<server>.<tailnet>.ts.net`, enter the PIN,
+2. Server: `docker compose up -d app; docker compose logs -f app`. Expect a
+   clean start on an empty journal and `Kiosk serving on 0.0.0.0:8765`.
+   A Telegram 409 means the dev bot still runs.
+   (Fresh start — no reclassify needed. When moving with real data, this is
+   where `docker compose exec app vos reclassify --rebuild` restores graph
+   categories; bound spend with `--from` on a large journal.)
+3. Tablet: browse to `https://<server>.<tailnet>.ts.net`, enter the PIN,
    re-grant mic (permission is per-origin), re-pin to home screen.
 5. Dev machine hygiene: `tailscale serve reset` so the old URL goes dark.
 
@@ -155,7 +157,7 @@ self-hosted runner (fine but more machinery than one personal server needs).
 - [ ] Tablet: `https://<server>.<tailnet>.ts.net/api/health` → 200, valid cert
 - [ ] Tablet mic capture end-to-end (first use downloads the whisper model once — watch the logs)
 - [ ] `docker compose restart app`, capture again — no re-download (hf-cache volume works)
-- [ ] Shopping list shows pre-migration items with correct bought states
+- [ ] Shopping: add an item from the kiosk Shopping tab → it appears in the Telegram list
 - [ ] New journal lines appear in `C:\VOS\journal\` on the host (bind mount = backupable)
 - [ ] **Reboot drill**: reboot now, verify Autologon → Docker → containers → tablet URL
 
@@ -164,11 +166,13 @@ self-hosted runner (fine but more machinery than one personal server needs).
 The dev machine keeps a complete pre-cutover copy (data was copied, not moved):
 
 1. Server: `docker compose stop app` (leave neo4j; harmless, preserves a retry).
-2. Taildrop the journal delta back: any `journal/*.jsonl` and new `artifacts/`
-   files changed since cutover. With the dev bot stopped the server files are a
-   strict superset — overwrite the dev copies. (If both machines ever polled
-   simultaneously the files diverge and need a line-wise merge by record id —
-   the "exactly one poller" rule exists to make that impossible.)
+2. Taildrop the server's `journal/` and `artifacts/` back to the dev machine.
+   Because this deployment was a fresh start, first archive the dev machine's
+   old *test* journal out of the way (e.g. rename to `journal-testdata/`) so
+   real records and test records never mix, then drop the server's files in.
+   Never let both machines poll simultaneously — that forks the journal and
+   forces a line-wise merge by record id; the "exactly one poller" rule exists
+   to make that impossible.
 3. Dev: start the bot; startup self-heal reprojects the copied-back records.
 4. If the kiosk matters during the outage, re-run `tailscale serve` on dev and
    repoint the tablet.
