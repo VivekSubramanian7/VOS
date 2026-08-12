@@ -24,6 +24,14 @@ read traffic after TLS termination). Tailscale has no public endpoint and its DE
 relays only ever forward ciphertext. If Tailscale itself becomes unwanted, the
 fallback is plain WireGuard + mkcert, at the cost of manual key and cert management.
 
+## Doctor tab
+
+Shows the open appointment slots at the practice configured in `VOS_DOCTOLIB_URL`,
+grouped by day, refreshed every two minutes while the tab is open. Read-only: nothing is
+journaled, no model is called, and the chips are chips rather than buttons because
+booking happens on Doctolib, not here. With Doctolib unset the tab says so and the rest
+of the kiosk is unaffected. See [doctolib.md](doctolib.md).
+
 ## One-time setup
 
 ### VOS machine (Windows dev server)

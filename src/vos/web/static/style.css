@@ -340,4 +340,38 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 .pin-error { color: var(--clay); min-height: 1.4em; }
 
+/* --- doctor slots -------------------------------------------------------- */
+
+.slots-day {
+  font-family: var(--display);
+  font-size: 1.15rem;
+  color: var(--saffron);
+  margin: 1.1rem 0 0.5rem;
+}
+
+.slots-day:first-child { margin-top: 0; }
+
+.slots-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+/* Chips, not buttons: booking happens on Doctolib, and something that looks
+   tappable but only informs is worse than something that plainly informs. */
+.slot {
+  padding: 0.7rem 1.1rem;
+  border-radius: 0.9rem;
+  background: var(--bubble-bot);
+  color: var(--cream);
+  font-size: 1.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.slots-empty {
+  color: var(--cream-dim);
+  font-size: 1.05rem;
+  margin: 0.6rem 0;
+}
+
 .hidden { display: none !important; }

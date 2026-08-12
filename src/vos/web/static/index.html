@@ -32,6 +32,9 @@
       <button id="mode-shopping" class="mode" role="tab" aria-selected="false">
         Shopping
       </button>
+      <button id="mode-doctor" class="mode" role="tab" aria-selected="false">
+        Doctor
+      </button>
     </nav>
     <span id="status-dot" class="dot" title="Connection"></span>
   </header>
@@ -41,6 +44,11 @@
   <main id="cards" class="cards hidden" aria-label="Tap to add to the shopping list">
     <p class="cards-hint">Tap what we need — it goes on the list and comes back once it's bought.</p>
     <div id="cards-grid" class="cards-grid"></div>
+  </main>
+
+  <main id="doctor" class="cards hidden" aria-label="Open appointment slots">
+    <p class="cards-hint">Free appointments at the practice. Book on Doctolib — slots go fast.</p>
+    <div id="doctor-list" class="slots"></div>
   </main>
 
   <section id="confirm" class="confirm hidden" aria-label="Check what I heard">

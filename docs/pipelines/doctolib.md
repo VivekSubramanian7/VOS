@@ -96,11 +96,20 @@ nothing. What matters is that a wrong answer never looks like a right one.
 | One malformed timestamp | The other slots, as normal | Skipped and logged; nine good slots are not lost to one bad one |
 | Genuinely no free slots | "Nothing free in the next two weeks" | Not an error |
 
-## 7. Commands
+## 7. Commands and surfaces
 
-| Command | Does |
+| Where | Does |
 |---|---|
-| `/doctor` | Open slots at the configured practice, next 15 days |
+| `/doctor` (Telegram) | Open slots at the configured practice, next 15 days |
+| Doctor tab (kiosk) | The same slots as chips, grouped by day, refreshed every 2 minutes |
+
+The kiosk tab is the reason this pipeline writes nothing. A wall tablet that anyone in
+the house can poke is not a surface you want journaling a record per glance, and because
+`GET /api/doctor` is pure read the tab can refresh on a timer without consequence. It
+polls at 2 minutes rather than the shopping tab's 45 seconds: this one leaves the house.
+
+Failures reach the tab as `200 {"ok": false, "detail": …}` rather than a 5xx, so a rate
+limit renders as the sentence Doctolib gave rather than as a browser network error.
 
 ## 8. Decisions
 

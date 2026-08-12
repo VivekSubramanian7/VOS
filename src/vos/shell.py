@@ -1041,6 +1041,7 @@ async def run() -> None:
                 cassette=cassette,
                 shopping=shopping,
                 shopping_pipeline=shopping_pipeline,
+                slot_fetcher=slot_fetcher,
                 chat_agent=KitchenChat(
                     model,
                     graph,

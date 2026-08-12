@@ -63,7 +63,8 @@ and `/stats` shows the spend.
 
 `/doctor` reads the open appointment slots at one practice on Doctolib and lists them by
 day. No account and no login: it asks the same public endpoint the booking page asks, on
-demand, once per command. Booking still happens on Doctolib.
+demand, once per command. Booking still happens on Doctolib. The kitchen kiosk has the
+same thing as a Doctor tab, refreshed while it is open.
 
 Setup is one paste. Open the practice's booking page, press F12 → Network, filter for
 `availabilities`, reload, and copy the `availabilities.json` request URL into

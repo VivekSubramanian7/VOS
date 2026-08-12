@@ -12,6 +12,7 @@ rather than holding the tablet's request open.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -711,3 +712,78 @@ async def test_server_leaves_the_sigint_handler_alone():
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, timeout=5)
+
+
+# --- doctor -------------------------------------------------------------- #
+
+
+class FakeSlotFetcher:
+    """Stands in for SlotFetcher: the endpoint only needs `.fetch()`."""
+
+    def __init__(self, snapshot=None, error: Exception | None = None) -> None:
+        self.snapshot = snapshot
+        self.error = error
+        self.calls = 0
+
+    async def fetch(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.snapshot
+
+
+async def test_doctor_is_503_when_doctolib_is_off():
+    """An unset VOS_DOCTOLIB_URL must leave the rest of the kiosk untouched."""
+    app = build_web_app(_deps())
+    async with _client(app) as c:
+        resp = await c.get("/api/doctor")
+    assert resp.status_code == 503
+
+
+async def test_doctor_returns_slots_as_iso_strings():
+    from vos.contracts import AppointmentSlot, DoctolibSnapshot
+
+    snapshot = DoctolibSnapshot(
+        source_url="https://www.doctolib.de/availabilities.json?x=1",
+        fetched_at=datetime(2026, 8, 12, 9, 0, tzinfo=UTC),
+        slots=[AppointmentSlot(starts_at=datetime(2026, 8, 19, 10, 20, tzinfo=UTC))],
+        total=1,
+    )
+    app = build_web_app(_deps(slot_fetcher=FakeSlotFetcher(snapshot)))
+    async with _client(app) as c:
+        resp = await c.get("/api/doctor")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["slots"] == ["2026-08-19T10:20:00+00:00"]
+
+
+async def test_a_doctolib_failure_is_a_200_the_tab_can_render():
+    """Rate limits and bot checks are expected answers, not server errors. A 5xx
+    here would make the tab show a network failure instead of the reason."""
+    from vos.contracts import DoctolibError
+
+    app = build_web_app(
+        _deps(slot_fetcher=FakeSlotFetcher(error=DoctolibError("Try again later.")))
+    )
+    async with _client(app) as c:
+        resp = await c.get("/api/doctor")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": False, "detail": "Try again later.", "slots": []}
+
+
+async def test_doctor_writes_nothing():
+    """Looking at a calendar is not a decision anybody authored, so unlike the
+    shopping tab there must be no journal entry and no queued job."""
+    from vos.contracts import DoctolibSnapshot
+
+    snapshot = DoctolibSnapshot(
+        source_url="https://www.doctolib.de/availabilities.json?x=1",
+        fetched_at=datetime(2026, 8, 12, 9, 0, tzinfo=UTC),
+    )
+    fetcher = FakeSlotFetcher(snapshot)
+    app = build_web_app(_deps(slot_fetcher=fetcher, journal=None, jobs=None))
+    async with _client(app) as c:
+        resp = await c.get("/api/doctor")
+    assert resp.status_code == 200
+    assert fetcher.calls == 1

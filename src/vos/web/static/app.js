@@ -25,7 +25,7 @@ const sessionId =
     return v;
   })();
 
-let mode = "capture"; // "capture" | "ask" | "shopping"
+let mode = "capture"; // "capture" | "ask" | "shopping" | "doctor"
 let recorder = null;
 let chunks = [];
 let pendingTranscript = null; // raw whisper text while the confirm card is open
@@ -44,6 +44,7 @@ const CARD_ITEMS = [
 
 let pendingSet = new Set(); // canonical names currently on the list
 let shoppingTimer = null;
+let doctorTimer = null;
 
 const canon = (name) => name.trim().toLowerCase().replace(/\s+/g, " ");
 
@@ -85,17 +86,22 @@ function bubble(text, who, extra = {}) {
 
 function setMode(next) {
   mode = next;
-  for (const m of ["capture", "ask", "shopping"]) {
+  for (const m of ["capture", "ask", "shopping", "doctor"]) {
     $(`mode-${m}`).classList.toggle("is-active", next === m);
     $(`mode-${m}`).setAttribute("aria-selected", String(next === m));
   }
 
   const shopping = next === "shopping";
+  const doctor = next === "doctor";
+  // Both panels replace the feed and hide the dock: neither takes typed input.
+  const panel = shopping || doctor;
   $("cards").classList.toggle("hidden", !shopping);
-  feed.classList.toggle("hidden", shopping);
-  document.querySelector(".dock").classList.toggle("hidden", shopping);
+  $("doctor").classList.toggle("hidden", !doctor);
+  feed.classList.toggle("hidden", panel);
+  document.querySelector(".dock").classList.toggle("hidden", panel);
+  if (panel) closeConfirm();
+
   if (shopping) {
-    closeConfirm();
     refreshShopping();
     // The tablet sits on this tab; bought items must reappear without a touch.
     shoppingTimer = shoppingTimer || setInterval(refreshShopping, 45000);
@@ -104,9 +110,87 @@ function setMode(next) {
     shoppingTimer = null;
   }
 
+  if (doctor) {
+    refreshDoctor();
+    // Slower than shopping: this hits somebody else's server, and a slot that
+    // appears is worth knowing about within a minute, not within a second.
+    doctorTimer = doctorTimer || setInterval(refreshDoctor, 120000);
+  } else if (doctorTimer) {
+    clearInterval(doctorTimer);
+    doctorTimer = null;
+  }
+
   $("confirm-send").textContent = next === "capture" ? "Save it" : "Ask";
   typeInput.placeholder =
     next === "capture" ? "…or type a thought to save" : "…or type a question";
+}
+
+/* --- doctor slots ----------------------------------------------------------- */
+
+function renderSlots(slots) {
+  const list = $("doctor-list");
+  list.textContent = "";
+  if (!slots.length) {
+    const empty = document.createElement("p");
+    empty.className = "slots-empty";
+    empty.textContent = "Nothing free in the next two weeks.";
+    list.appendChild(empty);
+    return;
+  }
+  let currentDay = null;
+  let group = null;
+  for (const iso of slots) {
+    const when = new Date(iso);
+    // Grouped by day because the decision is "which day", then "what time" —
+    // and a flat column of twenty timestamps is unreadable across a kitchen.
+    const day = when.toLocaleDateString(undefined, {
+      weekday: "short", day: "numeric", month: "short",
+    });
+    if (day !== currentDay) {
+      const heading = document.createElement("h2");
+      heading.className = "slots-day";
+      heading.textContent = day;
+      list.appendChild(heading);
+      group = document.createElement("div");
+      group.className = "slots-row";
+      list.appendChild(group);
+      currentDay = day;
+    }
+    const chip = document.createElement("span");
+    chip.className = "slot";
+    chip.textContent = when.toLocaleTimeString(undefined, {
+      hour: "2-digit", minute: "2-digit",
+    });
+    group.appendChild(chip);
+  }
+}
+
+async function refreshDoctor() {
+  const list = $("doctor-list");
+  try {
+    const resp = await api("/api/doctor");
+    if (resp.status === 503) {
+      list.textContent = "";
+      const off = document.createElement("p");
+      off.className = "slots-empty";
+      off.textContent = "Doctolib isn't set up on this VOS.";
+      list.appendChild(off);
+      return;
+    }
+    if (!resp.ok) return; // transient; the next refresh catches up
+    const data = await resp.json();
+    if (data.ok === false) {
+      list.textContent = "";
+      const err = document.createElement("p");
+      err.className = "slots-empty";
+      err.textContent = data.detail || "Couldn't reach Doctolib.";
+      list.appendChild(err);
+      return;
+    }
+    renderSlots(data.slots || []);
+  } catch {
+    /* transient — the next refresh catches up */
+  }
 }
 
 /* --- shopping cards --------------------------------------------------------- */
@@ -359,6 +443,7 @@ $("type-form").addEventListener("submit", (e) => {
 $("mode-capture").addEventListener("click", () => setMode("capture"));
 $("mode-ask").addEventListener("click", () => setMode("ask"));
 $("mode-shopping").addEventListener("click", () => setMode("shopping"));
+$("mode-doctor").addEventListener("click", () => setMode("doctor"));
 
 $("pin-form").addEventListener("submit", async (e) => {
   e.preventDefault();

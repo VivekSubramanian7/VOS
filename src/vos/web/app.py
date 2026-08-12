@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from vos.contracts import (
     CaptureRecord,
     Classification,
+    DoctolibError,
     ExtractedEntity,
     InputSource,
     ShoppingItem,
@@ -59,6 +60,7 @@ class KioskDeps:
     chat_agent: Any = None
     shopping: Any = None
     shopping_pipeline: Any = None
+    slot_fetcher: Any = None
     pin: str | None = None
     classify_timeout_s: float = 12.0
     """How long the capture endpoint waits for enrichment before answering
@@ -294,6 +296,30 @@ def build_web_app(deps: KioskDeps) -> FastAPI:
 
         items = await deps.shopping.pending_items()
         return {"saved": True, "pending": [i.canonical_name for i in items]}
+
+    @app.get("/api/doctor")
+    async def doctor() -> dict:
+        """Open appointment slots at the configured practice.
+
+        Read-only and writes nothing — unlike the shopping tab there is no journal
+        entry, because looking at a calendar is not a decision anybody authored. The
+        fetch runs inline rather than through the JobQueue: this endpoint holds up only
+        the tablet's own spinner, and the queue exists to protect the single writer,
+        which this never touches.
+        """
+        if deps.slot_fetcher is None:
+            raise HTTPException(status_code=503, detail="doctolib is not enabled")
+        try:
+            snapshot = await deps.slot_fetcher.fetch()
+        except DoctolibError as exc:
+            # 200 with an error field, not 5xx: this is a normal, expected answer
+            # ("Doctolib is rate-limiting") and the tab renders it as a message.
+            return {"ok": False, "detail": exc.reason, "slots": []}
+        return {
+            "ok": True,
+            "slots": [s.starts_at.isoformat() for s in snapshot.slots],
+            "total": snapshot.total,
+        }
 
     @app.post("/api/chat")
     async def chat(req: ChatRequest) -> dict:
