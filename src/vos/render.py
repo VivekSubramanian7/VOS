@@ -16,6 +16,7 @@ from typing import Protocol
 
 from vos.contracts import (
     CaptureResult,
+    DoctolibResult,
     GraphStats,
     ItemView,
     NoteView,
@@ -396,6 +397,44 @@ def render_pulse(result: PulseResult) -> str:
     return "\n".join(lines)
 
 
+# Enough to choose from without the message becoming a wall. Doctolib's own window is
+# 15 days, and a practice with more free slots than this is not the case that needs help.
+SHOWN_SLOTS = 24
+
+
+def render_doctor(result: DoctolibResult) -> str:
+    """Open appointment slots — the `/doctor` reply."""
+    if not result.ok:
+        return f"🩺 Couldn't check Doctolib — <i>{escape(result.error or 'unknown reason')}</i>."
+
+    lines = ["🩺 <b>Open appointments</b>"]
+
+    if result.slots:
+        shown = result.slots[:SHOWN_SLOTS]
+        current = None
+        for slot in shown:
+            # Grouped by day, because a flat list of 20 timestamps is unreadable and the
+            # decision the user is making is "which day", then "what time".
+            day = slot.starts_at.strftime("%a %d %b")
+            if day != current:
+                lines.append(f"\n<b>{escape(day)}</b>")
+                current = day
+            lines.append(f"  {slot.starts_at.strftime('%H:%M')}")
+        if len(result.slots) > len(shown):
+            lines.append(f"\n<i>…and {len(result.slots) - len(shown)} more.</i>")
+    else:
+        lines.append("\n<i>Nothing free in the next two weeks.</i>")
+
+    if result.notice:
+        lines.append(f"\n📋 <i>{escape(result.notice)}</i>")
+
+    # Availability is the most perishable thing VOS reports: the slot can be taken while
+    # the message is being read. Saying so is the difference between a stale answer and
+    # a wrong one.
+    lines.append("\n<i>As of now — book on Doctolib, slots go fast.</i>")
+    return "\n".join(lines)
+
+
 def render_all_posts(posts: list[PostView]) -> str:
     """Every stored post from one digest — the `/more` reply."""
     if not posts:
@@ -545,4 +584,7 @@ Send a YouTube link and I'll distil it automatically.
 Say what you need and I'll add it: “out of coffee, and 2L oat milk”.
 /shopping — the list, with a button per item to tick off
 /bought &lt;name|number&gt; — tick something off by typing
+
+<b>Appointments</b>
+/doctor — open slots at your practice on Doctolib
 """

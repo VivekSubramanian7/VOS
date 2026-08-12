@@ -41,6 +41,7 @@ uv run vos-bot                # long-polling; no public URL needed
 | *(a YouTube link)* | Distilled automatically into timestamped notes |
 | `/video <url>` · `/notes <term>` · `/redistil <url>` | Process now · search video notes · re-run from cache |
 | `/shopping` · `/bought <name\|number>` | The shopping list, with a tap-to-buy button per item |
+| `/doctor` | Open appointment slots at your practice on Doctolib |
 
 ### X pulse
 
@@ -57,6 +58,18 @@ xAI reports the exact amount it billed and that is what counts against
 `VOS_DAILY_BUDGET_USD`, so no estimate is involved. Lower `VOS_PULSE_MAX_TOOL_CALLS`
 to spend less. The budget guard refuses a pulse once the daily limit is reached,
 and `/stats` shows the spend.
+
+### Doctor appointments
+
+`/doctor` reads the open appointment slots at one practice on Doctolib and lists them by
+day. No account and no login: it asks the same public endpoint the booking page asks, on
+demand, once per command. Booking still happens on Doctolib.
+
+Setup is one paste. Open the practice's booking page, press F12 → Network, filter for
+`availabilities`, reload, and copy the `availabilities.json` request URL into
+`VOS_DOCTOLIB_URL`. That URL carries the calendar ids the public pages don't expose.
+
+Full design and failure modes: [docs/pipelines/doctolib.md](docs/pipelines/doctolib.md).
 
 ### Shopping
 

@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     vos_pulse_topic: str = Field(default="AI", alias="VOS_PULSE_TOPIC")
     vos_xai_base_url: str = Field(default="https://api.x.ai/v1", alias="VOS_XAI_BASE_URL")
 
+    # --- Doctolib (optional) ---------------------------------------------
+    # The full availabilities.json URL copied from the browser's Network tab, which
+    # carries the agenda_ids the public pages do not expose. Absent means /doctor is
+    # off. Not a secret - it addresses a public endpoint and grants nothing - so it is
+    # a plain str, not SecretStr.
+    vos_doctolib_url: str | None = Field(default=None, alias="VOS_DOCTOLIB_URL")
+
 
 _settings: Settings | None = None
 

@@ -40,6 +40,8 @@ from vos.cassette import BudgetGuard, Cassette
 from vos.contracts import (
     CaptureRecord,
     CaptureResult,
+    DoctolibError,
+    DoctolibResult,
     ItemMark,
     ItemView,
     SourceKind,
@@ -62,6 +64,7 @@ from vos.render import (
     render_all_notes,
     render_all_posts,
     render_capture,
+    render_doctor,
     render_following,
     render_pulse,
     render_search,
@@ -121,6 +124,7 @@ class VosBot:
         pulse_topic: str = "AI",
         shopping: Any = None,
         shopping_pipeline: Any = None,
+        slot_fetcher: Any = None,
     ) -> None:
         self.journal = journal
         self.graph = graph
@@ -133,6 +137,7 @@ class VosBot:
         self.pulse_topic = pulse_topic
         self.shopping = shopping
         self.shopping_pipeline = shopping_pipeline
+        self.slot_fetcher = slot_fetcher
 
     # -- capture -------------------------------------------------------- #
 
@@ -303,6 +308,46 @@ class VosBot:
             await _replace(note, message.answer, render_pulse(result))
 
         await self.jobs.submit(f"pulse:{topic}", job)
+
+    # -- doctor --------------------------------------------------------- #
+
+    async def cmd_doctor(self, message: Message, command: CommandObject) -> None:
+        """Open appointment slots at the configured practice.
+
+        Queued rather than inline for the same reason /pulse is: this is a network call
+        to somebody else's server with a 30s timeout, and the polling loop must not stall
+        behind it. It costs nothing, so there is no budget gate - the guard that matters
+        here is politeness, one request per explicit command.
+        """
+        if self.slot_fetcher is None:
+            await message.answer(
+                "🩺 Doctolib isn't set up.\n"
+                "Add <code>VOS_DOCTOLIB_URL=…</code> to your .env and restart.\n"
+                "It is the <code>availabilities.json</code> URL from the booking page's "
+                "Network tab - it carries the agenda ids the public pages don't expose."
+            )
+            return
+        if self.jobs is None:
+            await message.answer("Background jobs aren't enabled.")
+            return
+
+        async def job() -> None:
+            note = await message.answer("🩺 Checking Doctolib…")
+            try:
+                snapshot = await self.slot_fetcher.fetch()
+            except DoctolibError as exc:
+                await note.edit_text(render_doctor(DoctolibResult(error=exc.reason)))
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Doctolib check failed")
+                await note.edit_text(
+                    render_doctor(DoctolibResult(error=f"{type(exc).__name__}"))
+                )
+                return
+            result = DoctolibResult(slots=snapshot.slots, total=snapshot.total)
+            await _replace(note, message.answer, render_doctor(result))
+
+        await self.jobs.submit("doctor", job)
 
     # -- shopping ------------------------------------------------------- #
 
@@ -709,6 +754,7 @@ class VosBot:
         r.message.register(self.cmd_video, Command("video"))
         r.message.register(self.cmd_redistil, Command("redistil"))
         r.message.register(self.cmd_pulse, Command("pulse"))
+        r.message.register(self.cmd_doctor, Command("doctor"))
         r.message.register(self.cmd_notes, Command("notes"))
         r.message.register(self.cmd_more, Command("more"))
         r.message.register(self.cmd_shopping, Command("shopping"))
@@ -937,6 +983,15 @@ async def run() -> None:
             base_url=settings.vos_xai_base_url,
         )
 
+    slot_fetcher = None
+    if settings.vos_doctolib_url:
+        from vos.doctolib import SlotFetcher
+
+        slot_fetcher = SlotFetcher(
+            source_url=settings.vos_doctolib_url,
+            artifact_dir=settings.vos_artifact_dir,
+        )
+
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -953,6 +1008,7 @@ async def run() -> None:
         pulse_topic=settings.vos_pulse_topic,
         shopping=shopping,
         shopping_pipeline=shopping_pipeline,
+        slot_fetcher=slot_fetcher,
     )
 
     async def announce(text: str, **kwargs: Any):

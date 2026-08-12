@@ -615,6 +615,80 @@ class PulseError(Exception):
 
 
 # --------------------------------------------------------------------------- #
+# Doctolib — open appointment slots at one practice
+# --------------------------------------------------------------------------- #
+
+NAMESPACE_SLOT = UUID("6f1c3a84-9d27-4e05-bb63-2a8f7c41e590")
+
+
+def slot_id(agenda_ids: str, starts_at: datetime) -> UUID:
+    """One bookable slot. Keyed on the agendas plus the exact start time, because that
+    pair is what makes two slots the same slot: the same minute in a different practice's
+    calendar is a different appointment."""
+    return uuid5(NAMESPACE_SLOT, f"{agenda_ids}:{starts_at.isoformat()}")
+
+
+class AppointmentSlot(BaseModel):
+    """One free appointment time.
+
+    Deliberately just the start: Doctolib's availabilities endpoint returns no duration,
+    no practitioner and no room, and inventing any of those would be putting words in the
+    practice's mouth on a medical booking.
+    """
+
+    model_config = {"frozen": True}
+
+    starts_at: datetime
+
+
+class DoctolibSnapshot(BaseModel):
+    """What the endpoint said at one moment, cached on disk.
+
+    Availability is the most perishable thing VOS fetches — the slot read here can be
+    taken by someone else seconds later. The snapshot is kept anyway, for the same reason
+    a pulse digest is (ADR-010): it is fetched rather than authored, so it is an artifact
+    and never a journal entry, and it is the only evidence of what was offered when.
+    """
+
+    source_url: str
+    fetched_at: datetime
+    slots: list[AppointmentSlot] = Field(default_factory=list)
+    total: int = 0
+    """The endpoint's own count. Kept beside `slots` rather than derived from it: they
+    disagreeing is the signal that the response shape changed under us."""
+    raw_response: dict = Field(default_factory=dict)
+
+
+class DoctolibResult(BaseModel):
+    """Outcome of one /doctor — what the user is told."""
+
+    slots: list[AppointmentSlot] = Field(default_factory=list)
+    total: int = 0
+    notice: str | None = None
+    """The practice's own posted message (holiday closure, referral to a colleague).
+    Surfaced with the slots because an empty week reads as a bug without it."""
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+class DoctolibError(Exception):
+    """Raised when slots cannot be fetched. Carries a message fit to show the user.
+
+    `permanent` separates "ask again later" from "this will never work": a rate limit or
+    a bot challenge is transient, a practice that has left Doctolib is not. Same split as
+    `VideoProcessingError`.
+    """
+
+    def __init__(self, reason: str, *, permanent: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.permanent = permanent
+
+
+# --------------------------------------------------------------------------- #
 # Shopping list
 # --------------------------------------------------------------------------- #
 
