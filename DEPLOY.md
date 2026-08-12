@@ -143,6 +143,21 @@ Register-ScheduledTask -TaskName "VOS deploy" `
 Leave the default "Run only when user is logged on" — the docker CLI needs the
 session Docker Desktop lives in (covered by Autologon, §1.1.5).
 
+**Auto-deploy is server-only, enforced by the script itself.**
+`pull-deploy.ps1` exits immediately unless `deploy/.is-server` exists in its own
+checkout. That marker is created by `bootstrap-server.ps1` and is git-ignored,
+so it cannot travel in a clone: even if the scheduled task is somehow present
+on a dev machine, that machine pulls nothing and rebuilds nothing. The reason
+is the usual one — a second machine deploying itself means a second Telegram
+poller, and two pollers on one token fight with 409 Conflict. To retire a
+server, delete the marker (or the task); to move the server, run
+`bootstrap-server.ps1` on the new box and remove the marker from the old one.
+
+The poller also deploys only when `origin/main` strictly *contains* the local
+checkout. A checkout that is ahead (an unpushed local commit) or diverged is
+logged and skipped — comparing the two hashes for mere inequality would rebuild
+and restart the stack every 5 minutes for as long as the commit stayed unpushed.
+
 After this, deployment is: push to GitHub from the dev machine; within 5
 minutes the server pulls, rebuilds, and restarts. `deploy/pull-deploy.ps1`
 only acts when `origin/main` has new commits, pulls `--ff-only` (a diverged

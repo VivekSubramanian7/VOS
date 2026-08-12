@@ -177,6 +177,18 @@ if ($LASTEXITCODE -ne 0) { Fail 'tailscale serve failed' }
 tailscale serve status
 
 # 9. Auto-deploy task: poll origin/main every 5 minutes (see pull-deploy.ps1)
+# The marker is what makes pull-deploy.ps1 willing to act, and it is git-ignored
+# so it cannot travel to a dev clone. Running this script IS the declaration
+# that this machine is the server, so the marker belongs here.
+$marker = Join-Path $Repo 'deploy\.is-server'
+if (Test-Path $marker) {
+    Say 'Deploy marker present (this checkout is the server)'
+} else {
+    Say 'Marking this checkout as the deploy target (deploy\.is-server)'
+    "This checkout is the VOS deploy target. Created by bootstrap-server.ps1; git-ignored on purpose." |
+        Set-Content -Path $marker -Encoding ascii
+}
+
 if (Get-ScheduledTask -TaskName 'VOS deploy' -ErrorAction SilentlyContinue) {
     Say "Scheduled task 'VOS deploy' already registered"
 } else {

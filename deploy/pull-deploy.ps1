@@ -5,13 +5,30 @@
 
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+$log = Join-Path $PSScriptRoot "deploy.log"
+
+# Auto-deploy is SERVER-ONLY. The marker file is created by bootstrap-server.ps1
+# and is git-ignored, so it can never travel in a clone: a dev checkout that
+# happens to have this scheduled task registered pulls nothing and rebuilds
+# nothing. Deploying on a second machine would start a second Telegram poller,
+# and two pollers on one token fight with 409 Conflict.
+if (-not (Test-Path (Join-Path $PSScriptRoot '.is-server'))) { exit 0 }
 
 git fetch --quiet origin main
 $local  = git rev-parse HEAD
 $remote = git rev-parse origin/main
 if ($local -eq $remote) { exit 0 }   # nothing new - silent no-op
 
-$log = Join-Path $PSScriptRoot "deploy.log"
+# Deploy only when origin/main strictly CONTAINS this checkout. Comparing the
+# two hashes for inequality is not enough: a checkout that is AHEAD (an unpushed
+# local commit) or diverged also compares unequal, and would then rebuild and
+# restart the stack on every single run, every 5 minutes, forever.
+git merge-base --is-ancestor HEAD origin/main
+if ($LASTEXITCODE -ne 0) {
+    "$(Get-Date -Format s) skipped: HEAD $($local.Substring(0,8)) is not behind origin/main (ahead or diverged)" | Add-Content $log
+    exit 0
+}
+
 "$(Get-Date -Format s) deploying $remote" | Add-Content $log
 
 # --ff-only: a diverged server checkout halts loudly instead of merging.

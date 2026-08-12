@@ -17,6 +17,11 @@ shopping.db-shm
 # Server-side auto-deploy log (deploy/pull-deploy.ps1)
 deploy/deploy.log
 
+# Marks THIS checkout as the deploy target. Never commit it: pull-deploy.ps1
+# refuses to deploy without it, which is what keeps a dev clone from pulling
+# and rebuilding itself into a second Telegram poller.
+deploy/.is-server
+
 # Python
 __pycache__/
 *.py[cod]
