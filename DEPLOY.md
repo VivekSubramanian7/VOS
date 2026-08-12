@@ -39,11 +39,15 @@ never start by accident. In an elevated PowerShell on the server:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
-C:\VOS\deploy\bootstrap-server.ps1            # bootstrap (repeat until clean)
-C:\VOS\deploy\bootstrap-server.ps1 -Cutover   # only after stopping the dev bot
+.\deploy\bootstrap-server.ps1            # bootstrap (repeat until clean)
+.\deploy\bootstrap-server.ps1 -Cutover   # only after stopping the dev bot
 ```
 
+Run from inside a checkout it uses that checkout; run standalone (the file
+downloaded on its own) it clones to `C:\VOS`.
+
 Two things stay manual: Autologon (§1.1.5) and the tablet repoint (§2).
+Once bootstrapped, day-to-day starting and stopping is §2.1.
 The subsections below document what the script does, and serve as the manual
 fallback.
 
@@ -153,11 +157,13 @@ self-hosted runner (fine but more machinery than one personal server needs).
 ## 2. Cutover
 
 1. **Stop the dev bot FIRST** — kill any `uv run vos-bot` and
-   `docker compose stop app` on the dev machine. Do NOT `down -v` there: the
-   dev Neo4j volume is the rollback state.
-2. Server: `docker compose up -d app; docker compose logs -f app`. Expect a
-   clean start on an empty journal and `Kiosk serving on 0.0.0.0:8765`.
-   A Telegram 409 means the dev bot still runs.
+   `docker compose stop app` on the dev machine (`deploy\stop-vos.ps1` if it
+   has these scripts). Do NOT `down -v` there: the dev Neo4j volume is the
+   rollback state.
+2. Server: `deploy\bootstrap-server.ps1 -Cutover` (or `deploy\start-vos.ps1`
+   directly, plus `docker compose logs -f app`). Expect a clean start on an
+   empty journal and `Kiosk serving on 0.0.0.0:8765`. A Telegram 409 means the
+   dev bot still runs — the script says so explicitly.
    (Fresh start — no reclassify needed. When moving with real data, this is
    where `docker compose exec app vos reclassify --rebuild` restores graph
    categories; bound spend with `--from` on a large journal.)
@@ -177,6 +183,38 @@ self-hosted runner (fine but more machinery than one personal server needs).
 - [ ] Shopping: add an item from the kiosk Shopping tab → it appears in the Telegram list
 - [ ] New journal lines appear in `C:\VOS\journal\` on the host (bind mount = backupable)
 - [ ] **Reboot drill**: reboot now, verify Autologon → Docker → containers → tablet URL
+
+## 2.1 Daily operation
+
+Once the server is bootstrapped and cut over, starting and stopping VOS is one
+command each. Both scripts work from any checkout path (they resolve the repo
+from their own location) and are idempotent:
+
+```powershell
+deploy\start-vos.ps1              # Docker Desktop, Neo4j (wait healthy), app, health check
+deploy\start-vos.ps1 -Neo4jOnly   # database only — starts NO Telegram poller
+deploy\start-vos.ps1 -Build       # rebuild the image first (uncommitted local edits)
+deploy\start-vos.ps1 -Follow      # then tail the app logs
+
+deploy\stop-vos.ps1               # stop the app — releases the Telegram poller
+deploy\stop-vos.ps1 -All          # also stop Neo4j
+```
+
+`start-vos.ps1` enforces the ordering this runbook otherwise asks a human to
+remember: Neo4j must report `(healthy)` before the app starts, and the app must
+answer `/api/health` before the script claims success. It then greps the app
+log for a Telegram 409 and names the fix, so a second poller shows up as a
+message rather than as a bot that silently ignores you.
+
+`-Neo4jOnly` is the mode to use while another machine still polls Telegram —
+it is exactly the state §1.5 leaves you in.
+
+`stop-vos.ps1` only ever stops containers. It never runs `docker compose down`,
+and never `down -v`: that deletes `neo4j-data` (including the `NEO4J_AUTH`
+password baked in at first start), `vos-data`, and the whisper model cache.
+Note that `restart: unless-stopped` does **not** resurrect a container you
+stopped on purpose — after `stop-vos.ps1` the stack stays down across reboots
+until you run `start-vos.ps1`.
 
 ## 3. Rollback
 

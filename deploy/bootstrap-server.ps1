@@ -5,21 +5,31 @@ re-run after a reboot or a failed step; every step checks before it acts.
 Usage, in an ELEVATED PowerShell on the SERVER:
 
     Set-ExecutionPolicy -Scope Process Bypass -Force
-    C:\VOS\deploy\bootstrap-server.ps1            # bootstrap: install, build, serve
-    C:\VOS\deploy\bootstrap-server.ps1 -Cutover   # start the bot (dev bot must be STOPPED)
+    .\deploy\bootstrap-server.ps1            # bootstrap: install, build, serve
+    .\deploy\bootstrap-server.ps1 -Cutover   # start the bot (dev bot must be STOPPED)
 
 (First run: download just this file, or clone the repo manually - the script
-clones/updates C:\VOS itself either way.)
+clones/updates the repo itself either way. Run from inside a checkout and that
+checkout is used; run it standalone and it clones to C:\VOS.)
 
 Cutover is a separate flag on purpose: Telegram long-polling is exclusive, and
 starting the app while the dev machine still polls means 409 Conflict. The
 bootstrap half touches nothing that conflicts with the running dev bot.
+
+This is one-time setup plus the one-time switch-over. Day-to-day starting and
+stopping is deploy\start-vos.ps1 and deploy\stop-vos.ps1.
 #>
 param([switch]$Cutover)
 
 $ErrorActionPreference = 'Stop'
 $RepoUrl = 'https://github.com/VivekSubramanian7/VOS.git'
-$Repo    = 'C:\VOS'
+
+# When this script runs from inside a checkout, that checkout IS the repo -
+# hardcoding a path would clone a second copy beside an existing one and then
+# register the scheduled task against the wrong tree. A standalone download has
+# no repo around it, so it falls back to the canonical server path and clones.
+$parent = Split-Path -Parent $PSScriptRoot
+if ($PSScriptRoot -and (Test-Path (Join-Path $parent '.git'))) { $Repo = $parent } else { $Repo = 'C:\VOS' }
 
 function Say($msg)  { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Warn($msg) { Write-Host "!!  $msg" -ForegroundColor Yellow }
@@ -47,19 +57,15 @@ if ($Cutover) {
     $answer = Read-Host 'Is the DEV machine bot fully stopped? Two pollers on one token fight with 409 Conflict. Type yes to continue'
     if ($answer -ne 'yes') { Fail 'Stop the dev bot first, then re-run with -Cutover' }
 
-    Say 'Starting the app container...'
-    docker compose up -d app
-    if ($LASTEXITCODE -ne 0) { Fail 'docker compose up -d app failed' }
-
-    Say 'Waiting 15s for startup, then checking kiosk health...'
-    Start-Sleep -Seconds 15
-    try {
-        $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8765/api/health' -TimeoutSec 10
-        Say "Kiosk health: HTTP $($r.StatusCode)"
-    } catch {
-        Warn 'Kiosk health check failed - inspect: docker compose logs app'
-    }
-    docker compose logs --tail 20 app
+    # The start itself is start-vos.ps1's job - one implementation of the
+    # ordering, the health gate and the 409 check, used every day after this.
+    # Resolved against $Repo, not $PSScriptRoot: a standalone-downloaded copy of
+    # this file has no siblings, but the repo it cloned does.
+    $start = Join-Path $Repo 'deploy\start-vos.ps1'
+    if (-not (Test-Path $start)) { Fail "$start not found - run the bootstrap half first so the repo exists" }
+    Say 'Starting the stack...'
+    & $start
+    if ($LASTEXITCODE -ne 0) { Fail 'start-vos.ps1 failed' }
 
     $fqdn = (tailscale status --json | ConvertFrom-Json).Self.DNSName.TrimEnd('.')
     Write-Host ''
@@ -187,3 +193,7 @@ Write-Host '  1. Autologon (Sysinternals) so containers survive unattended reboo
 Write-Host '     https://learn.microsoft.com/en-us/sysinternals/downloads/autologon'
 Write-Host '  2. When ready to switch: STOP the dev bot, then run'
 Write-Host "     $Repo\deploy\bootstrap-server.ps1 -Cutover"
+Write-Host ''
+Write-Host 'After that, day-to-day operation is:'
+Write-Host "     $Repo\deploy\start-vos.ps1     # start everything"
+Write-Host "     $Repo\deploy\stop-vos.ps1      # stop the app (frees the poller)"

@@ -97,6 +97,12 @@ Full setup (tablet included) and the privacy model: `docs/pipelines/kitchen-kios
 | Rebuild the graph | `vos reclassify --rebuild` |
 | Preview a prompt change | `vos reclassify --dry-run` |
 | Change model | edit `VOS_MODEL`, restart |
+| Start / stop on the server | `deploy\start-vos.ps1` · `deploy\stop-vos.ps1` |
+
+Server deployment (Windows + docker compose + tailnet-only kiosk) is documented
+in [DEPLOY.md](DEPLOY.md): `deploy/bootstrap-server.ps1` sets a machine up once,
+`deploy/start-vos.ps1` and `deploy/stop-vos.ps1` run it day to day, and
+`deploy/pull-deploy.ps1` auto-deploys new commits every 5 minutes.
 
 ## Testing
 
