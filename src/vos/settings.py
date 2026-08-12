@@ -69,7 +69,11 @@ class Settings(BaseSettings):
     # $0.025 per source on top of tokens, so `max_sources` is the cost lever:
     # 25 sources is roughly $0.63 per digest against the daily budget above.
     xai_api_key: SecretStr | None = Field(default=None, alias="XAI_API_KEY")
-    vos_pulse_model: str = Field(default="grok-4.1-fast", alias="VOS_PULSE_MODEL")
+    # xAI retires model ids without notice, and a stale one fails the whole
+    # digest with an opaque HTTP error rather than anything about models.
+    # `vos doctor` lists what the key can actually reach - run it if /pulse
+    # starts failing before assuming the key is bad.
+    vos_pulse_model: str = Field(default="grok-4.6", alias="VOS_PULSE_MODEL")
     vos_pulse_max_sources: int = Field(default=25, alias="VOS_PULSE_MAX_SOURCES")
     vos_pulse_topic: str = Field(default="AI", alias="VOS_PULSE_TOPIC")
     vos_xai_base_url: str = Field(default="https://api.x.ai/v1", alias="VOS_XAI_BASE_URL")
