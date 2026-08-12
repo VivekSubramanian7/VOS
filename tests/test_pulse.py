@@ -16,9 +16,9 @@ import pytest
 
 from vos.contracts import PulseError
 from vos.pulse import (
-    SOURCE_COST_USD,
+    MAX_X_HANDLES,
     PulseFetcher,
-    build_search_parameters,
+    build_x_search_tool,
     canonical_post_url,
     normalise_handle,
     parse_digest,
@@ -113,25 +113,33 @@ def test_status_id_followed_by_a_query_string_still_canonicalises():
 
 
 def test_followed_handles_reach_xai_without_the_at_sign():
-    params = build_search_parameters(["@karpathy", "@sama"], now=NOW, max_sources=25)
-    assert params["sources"] == [{"type": "x", "x_handles": ["karpathy", "sama"]}]
+    tool = build_x_search_tool(["@karpathy", "@sama"], now=NOW)
+    assert tool["type"] == "x_search"
+    assert tool["allowed_x_handles"] == ["karpathy", "sama"]
 
 
 def test_no_handles_means_an_unfiltered_trending_search():
     """Following nobody is a normal state, not an error — the digest still works."""
-    params = build_search_parameters([], now=NOW, max_sources=25)
-    assert params["sources"] == [{"type": "x"}]
-    assert "x_handles" not in params["sources"][0]
+    tool = build_x_search_tool([], now=NOW)
+    assert tool["type"] == "x_search"
+    assert "allowed_x_handles" not in tool
 
 
 def test_search_window_is_the_last_day():
-    params = build_search_parameters([], now=NOW, max_sources=25)
-    assert params["from_date"] == "2026-08-08"
+    tool = build_x_search_tool([], now=NOW)
+    assert tool["from_date"] == "2026-08-08"
+    assert tool["to_date"] == "2026-08-09"
 
 
-def test_source_cap_is_passed_through():
-    """This is the cost lever — $0.025 a source — so it must not be silently dropped."""
-    assert build_search_parameters([], now=NOW, max_sources=8)["max_search_results"] == 8
+def test_handles_are_truncated_to_the_api_limit():
+    """xAI rejects more than 20 outright; losing the 21st beats losing the digest."""
+    tool = build_x_search_tool([f"@user{i}" for i in range(30)], now=NOW)
+    assert len(tool["allowed_x_handles"]) == MAX_X_HANDLES
+
+
+def test_the_tool_is_the_only_one_offered():
+    """A stray web_search would quietly change what a digest of X means."""
+    assert build_x_search_tool([], now=NOW)["type"] == "x_search"
 
 
 # -- parsing ---------------------------------------------------------------- #
@@ -223,14 +231,31 @@ def test_a_payload_with_no_posts_is_valid_not_an_error():
 # -- PulseFetcher ------------------------------------------------------------ #
 
 
-def _response(content: str, *, sources: int = 3) -> dict:
+def _response(content: str, *, sources: int = 3, ticks: int | None = 299_800_000) -> dict:
+    """An Agent Tools response: `output` items, not `choices`.
+
+    Shaped after a real /v1/responses body — reasoning and tool-call items come
+    before the message, which is why the parser cannot just index [0].
+    """
+    usage: dict = {
+        "input_tokens": 1000,
+        "output_tokens": 500,
+        "num_sources_used": sources,
+        "num_server_side_tools_used": 1,
+    }
+    if ticks is not None:
+        usage["cost_in_usd_ticks"] = ticks
     return {
-        "choices": [{"message": {"content": content}}],
-        "usage": {
-            "prompt_tokens": 1000,
-            "completion_tokens": 500,
-            "num_sources_used": sources,
-        },
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "custom_tool_call", "name": "x_keyword_search", "status": "completed"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content, "annotations": []}],
+            },
+        ],
+        "usage": usage,
     }
 
 
@@ -253,8 +278,8 @@ def _fetcher(tmp_path: Path, transport) -> PulseFetcher:
     return PulseFetcher(
         api_key="test-key",
         artifact_dir=tmp_path,
-        model="grok-4.1-fast",
-        max_sources=25,
+        model="grok-4.6",
+        max_tool_calls=8,
         transport=transport,
         now=lambda: NOW,
     )
@@ -265,7 +290,7 @@ async def test_fetch_returns_a_digest(tmp_path: Path):
     artifact, dropped = await fetcher.fetch("AI", [])
     assert dropped == 0
     assert artifact.digest.posts[0].author_handle == "@karpathy"
-    assert artifact.model == "grok-4.1-fast"
+    assert artifact.model == "grok-4.6"
 
 
 async def test_the_digest_is_cached_to_disk(tmp_path: Path):
@@ -289,7 +314,7 @@ async def test_the_retry_tells_the_model_what_was_wrong(tmp_path: Path):
     fetcher = _fetcher(tmp_path, transport)
 
     await fetcher.fetch("AI", [])
-    retry_messages = transport.bodies[1]["messages"]
+    retry_messages = transport.bodies[1]["input"]
     assert "not JSON" in retry_messages[-1]["content"]
 
 
@@ -307,27 +332,32 @@ async def test_a_transport_failure_raises_pulse_error(tmp_path: Path):
         await fetcher.fetch("AI", [])
 
 
-async def test_cost_counts_sources_and_tokens(tmp_path: Path):
+async def test_cost_is_what_xai_says_it_billed(tmp_path: Path):
+    """Not modelled: ticks are the amount actually charged, 1 USD = 10^10 ticks."""
     fetcher = _fetcher(tmp_path, StubTransport(_response(_payload(), sources=10)))
     artifact, _ = await fetcher.fetch("AI", [])
     assert artifact.sources_used == 10
-    assert artifact.cost_usd is not None
-    assert artifact.cost_usd >= 10 * SOURCE_COST_USD
+    assert artifact.cost_usd == pytest.approx(0.02998)
 
 
-async def test_cost_assumes_the_full_cap_when_usage_is_missing(tmp_path: Path):
-    """Under-counting spend would let the budget guard be walked straight through."""
-    response = _response(_payload())
-    del response["usage"]
-    fetcher = _fetcher(tmp_path, StubTransport(response))
+async def test_cost_falls_back_to_token_pricing_without_ticks(tmp_path: Path):
+    """Old cassettes predate the field; spending must still be counted."""
+    fetcher = _fetcher(tmp_path, StubTransport(_response(_payload(), ticks=None)))
     artifact, _ = await fetcher.fetch("AI", [])
     assert artifact.cost_usd is not None
-    assert artifact.cost_usd >= 25 * SOURCE_COST_USD
+    assert artifact.cost_usd > 0
 
 
 async def test_followed_handles_reach_the_request(tmp_path: Path):
     transport = StubTransport(_response(_payload()))
     fetcher = _fetcher(tmp_path, transport)
     await fetcher.fetch("AI", ["@karpathy"])
-    params = transport.bodies[0]["search_parameters"]
-    assert params["sources"][0]["x_handles"] == ["karpathy"]
+    tool = transport.bodies[0]["tools"][0]
+    assert tool["allowed_x_handles"] == ["karpathy"]
+
+
+async def test_the_tool_call_cap_reaches_the_request(tmp_path: Path):
+    """The remaining cost lever, so it must not be silently dropped."""
+    transport = StubTransport(_response(_payload()))
+    await _fetcher(tmp_path, transport).fetch("AI", [])
+    assert transport.bodies[0]["max_tool_calls"] == 8

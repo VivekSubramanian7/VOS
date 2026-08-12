@@ -65,16 +65,18 @@ class Settings(BaseSettings):
     vos_kiosk_pin: SecretStr | None = Field(default=None, alias="VOS_KIOSK_PIN")
 
     # --- X pulse (optional) ---------------------------------------------
-    # Absent key means /pulse is off; nothing else changes. Live Search bills
-    # $0.025 per source on top of tokens, so `max_sources` is the cost lever:
-    # 25 sources is roughly $0.63 per digest against the daily budget above.
+    # Absent key means /pulse is off; nothing else changes. Cost is now read back
+    # from xAI (`usage.cost_in_usd_ticks`) rather than modelled: a digest measured
+    # at ~$0.20, tokens dominating, with `max_tool_calls` bounding the searches.
     xai_api_key: SecretStr | None = Field(default=None, alias="XAI_API_KEY")
     # xAI retires model ids without notice, and a stale one fails the whole
     # digest with an opaque HTTP error rather than anything about models.
     # `vos doctor` lists what the key can actually reach - run it if /pulse
     # starts failing before assuming the key is bad.
     vos_pulse_model: str = Field(default="grok-4.6", alias="VOS_PULSE_MODEL")
-    vos_pulse_max_sources: int = Field(default=25, alias="VOS_PULSE_MAX_SOURCES")
+    # Replaces VOS_PULSE_MAX_SOURCES: the Agent Tools API has no per-search result
+    # cap, so the bound that remains is how many searches one digest may run.
+    vos_pulse_max_tool_calls: int = Field(default=8, alias="VOS_PULSE_MAX_TOOL_CALLS")
     vos_pulse_topic: str = Field(default="AI", alias="VOS_PULSE_TOPIC")
     vos_xai_base_url: str = Field(default="https://api.x.ai/v1", alias="VOS_XAI_BASE_URL")
 

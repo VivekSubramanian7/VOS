@@ -43,9 +43,10 @@ PRICING: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro-preview": (2.00, 12.00),
     "gemini-2.5-pro": (1.25, 10.00),
     # Family fallback — PRICING matches by substring, longest key first, so this
-    # covers every grok variant. Token cost is a rounding error next to Live
-    # Search's $0.025/source, so an approximate rate is honest here.
-    "grok": (1.25, 2.50),
+    # covers every grok variant. Rate is grok-4.6's. Only a fallback for /pulse
+    # now: xAI returns the billed cost directly, and this is used when a response
+    # predates that field.
+    "grok": (2.00, 6.00),
 }
 
 

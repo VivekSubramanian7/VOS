@@ -1,4 +1,4 @@
-"""X pulse — trending posts via xAI Live Search.
+"""X pulse — trending posts via the xAI Agent Tools API.
 
 Two things here are load-bearing.
 
@@ -7,14 +7,20 @@ exist, and a well-formed link to nothing is worse than no link at all: it still
 looks checkable. Anything that is not a real post URL shape is dropped and counted,
 never rendered.
 
-`build_search_parameters` owns the only field that costs money. Live Search bills
-per source fetched, so `max_search_results` is the difference between a digest that
-costs cents and one that eats the daily budget. It is threaded from settings rather
-than hardcoded, and it is asserted in tests for that reason.
+Cost is read back, not estimated. xAI reports `usage.cost_in_usd_ticks` — the
+amount actually billed, after cache discounts and inclusive of server-side tool
+invocations — so the budget guard charges the real figure instead of a modelled
+one. `max_tool_calls` bounds how many searches a single digest may run.
 
-LangChain is deliberately not used here. `search_parameters` is an xAI-specific
-extension, and routing it through `init_chat_model` would hide the one field that
-governs spend.
+LangChain is deliberately not used here. The Agent Tools API is an xAI-specific
+endpoint (`/v1/responses`, not `/v1/chat/completions`), and routing it through
+`init_chat_model` would hide both the tool config and the spend field.
+
+Migrated from Live Search (`search_parameters`), which xAI retired: those requests
+now return 410 Gone with "Live search is deprecated. Please switch to the Agent
+Tools API." The old per-source price of $0.025 went with it. A measured digest
+costs ~$0.20 against the old ~$0.63, and the shape of the bill changed: tokens
+now dominate, because agentic search reasons between searches.
 """
 
 from __future__ import annotations
@@ -39,9 +45,12 @@ _POST = re.compile(
     re.IGNORECASE,
 )
 
-# Live Search list price, USD per source fetched. The dominant cost of a digest —
-# tokens are a rounding error beside it.
-SOURCE_COST_USD = 0.025
+# xAI reports cost in ticks: 1 USD = 10^10 ticks. Integer ticks are the precise
+# figure; the float division happens once, at the edge.
+USD_TICKS = 10_000_000_000
+
+# xAI caps an allow-list at 20 handles and rejects the request above that.
+MAX_X_HANDLES = 20
 
 
 def normalise_handle(raw: str) -> str | None:
@@ -68,25 +77,29 @@ def canonical_post_url(url: str) -> str | None:
     return f"https://x.com/{match.group(1)}/status/{match.group(2)}" if match else None
 
 
-def build_search_parameters(
+def build_x_search_tool(
     handles: list[str],
     *,
     now: datetime,
-    max_sources: int,
     window_hours: int = 24,
 ) -> dict:
-    """The xAI Live Search block. `max_search_results` is the cost lever."""
-    source: dict = {"type": "x"}
+    """The x_search server-side tool block for the Agent Tools API.
+
+    Direct successor to the old Live Search `sources[0].x_handles`: followed
+    accounts scope the search, exactly as before. xAI rejects more than 20, which
+    Live Search did not, so the list is truncated rather than allowed to fail the
+    whole digest.
+    """
+    tool: dict = {
+        "type": "x_search",
+        # Inclusive of both endpoints, ISO8601 date only (no time component).
+        "from_date": (now - timedelta(hours=window_hours)).date().isoformat(),
+        "to_date": now.date().isoformat(),
+    }
     if handles:
         # xAI wants bare names; we store them with the leading @.
-        source["x_handles"] = [h.lstrip("@") for h in handles]
-    return {
-        "mode": "on",
-        "sources": [source],
-        "from_date": (now - timedelta(hours=window_hours)).date().isoformat(),
-        "max_search_results": max_sources,
-        "return_citations": True,
-    }
+        tool["allowed_x_handles"] = [h.lstrip("@") for h in handles[:MAX_X_HANDLES]]
+    return tool
 
 
 def _strip_fence(content: str) -> str:
@@ -204,7 +217,7 @@ class PulseFetcher:
     """One digest per call, cached on disk.
 
     The transport is injectable so the whole retry and parsing path is testable
-    without a network — and so no test can ever spend a real $0.025 per source.
+    without a network — and so no test can ever spend real money.
     """
 
     def __init__(
@@ -213,7 +226,7 @@ class PulseFetcher:
         api_key: str,
         artifact_dir: Path,
         model: str,
-        max_sources: int,
+        max_tool_calls: int,
         base_url: str = "https://api.x.ai/v1",
         transport: Transport | None = None,
         now: Callable[[], datetime] | None = None,
@@ -222,7 +235,7 @@ class PulseFetcher:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._api_key = api_key
         self._model = model
-        self._max_sources = max_sources
+        self._max_tool_calls = max_tool_calls
         self._base_url = base_url.rstrip("/")
         self._transport = transport or self._http
         self._now = now or (lambda: datetime.now(UTC))
@@ -236,11 +249,14 @@ class PulseFetcher:
         ]
         body = {
             "model": self._model,
-            "messages": messages,
-            "search_parameters": build_search_parameters(
-                handles, now=asked_at, max_sources=self._max_sources
-            ),
-            "response_format": {"type": "json_object"},
+            # The Agent Tools API calls this `input`, not `messages`.
+            "input": messages,
+            "tools": [build_x_search_tool(handles, now=asked_at)],
+            # The cost lever. Live Search charged per source and was capped with
+            # max_search_results; here the model decides how much to read per
+            # search, and the bound that remains is how many searches it may run.
+            "max_tool_calls": self._max_tool_calls,
+            "text": {"format": {"type": "json_object"}},
         }
 
         problem = "no response"
@@ -261,7 +277,7 @@ class PulseFetcher:
                 # Naming the fault matters: a bare retry usually fails identically.
                 body = {
                     **body,
-                    "messages": [
+                    "input": [
                         *messages,
                         {
                             "role": "user",
@@ -284,21 +300,31 @@ class PulseFetcher:
         self, digest: PulseDigest, payload: dict, asked_at: datetime
     ) -> PulseArtifact:
         usage = payload.get("usage") or {}
-        # Falling back to the full cap keeps the budget honest: under-counting spend
-        # is the one direction that lets the guard be walked straight through.
-        sources = int(usage.get("num_sources_used") or self._max_sources)
-        tokens = price(
-            self._model,
-            int(usage.get("prompt_tokens") or 0),
-            int(usage.get("completion_tokens") or 0),
-        )
+        # The Agent Tools API reports num_sources_used as 0 in practice, so the
+        # citation annotations are the honest count of what was actually read.
+        sources = int(usage.get("num_sources_used") or 0) or _citation_count(payload)
+        # xAI bills this exact figure, tokens and tool invocations together, so
+        # there is nothing left to model. Only when it is absent (an old cassette,
+        # a stubbed transport) do we fall back to pricing the tokens ourselves —
+        # and then to counting sources, because under-counting spend is the one
+        # direction that lets the budget guard be walked straight through.
+        ticks = usage.get("cost_in_usd_ticks")
+        if ticks is not None:
+            cost = int(ticks) / USD_TICKS
+        else:
+            tokens = price(
+                self._model,
+                int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+                int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+            )
+            cost = tokens or 0.0
         return PulseArtifact(
             digest=digest,
             raw_response=payload,
             fetched_at=asked_at,
             model=self._model,
             sources_used=sources,
-            cost_usd=(tokens or 0.0) + sources * SOURCE_COST_USD,
+            cost_usd=cost,
         )
 
     def _write(self, artifact: PulseArtifact) -> None:
@@ -312,9 +338,11 @@ class PulseFetcher:
     async def _http(self, body: dict) -> dict:
         import httpx
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # Agentic search runs several searches server-side before answering, so
+        # this is slower than a plain completion - 180s, not 120s.
+        async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(
-                f"{self._base_url}/chat/completions",
+                f"{self._base_url}/responses",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=body,
             )
@@ -322,7 +350,38 @@ class PulseFetcher:
             return response.json()
 
 
+def _citation_count(payload: dict) -> int:
+    """How many sources the answer actually cites."""
+    urls = set()
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            for note in part.get("annotations") or []:
+                if isinstance(note, dict) and note.get("type") == "url_citation":
+                    urls.add(note.get("url"))
+    return len(urls)
+
+
 def _content_of(payload: dict) -> str:
+    """The assistant text out of an Agent Tools response.
+
+    `output` is a sequence of items - reasoning, tool calls, then the message -
+    so the answer is not at a fixed index the way `choices[0]` was. Reading the
+    LAST message item is what makes this robust to however many searches ran.
+    """
+    text = ""
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = str(part.get("text") or "")
+    if text:
+        return text
+    # Older cassettes were recorded against /chat/completions.
     try:
         return str(payload["choices"][0]["message"]["content"] or "")
     except (KeyError, IndexError, TypeError):

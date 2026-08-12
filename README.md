@@ -44,16 +44,19 @@ uv run vos-bot                # long-polling; no public URL needed
 
 ### X pulse
 
-`/pulse` asks xAI Live Search for the best of the last 24 hours on X, defaulting to
+`/pulse` asks xAI to search X for the best of the last 24 hours, defaulting to
 AI. `/pulse quantum computing` asks about something else. Every item is stored in the
 graph, so `/more` lists them all and `/notes <term>` searches them alongside video
 notes.
 
 `/follow x @karpathy` weights an account in the digest. `/following` lists them.
 
-**This costs money.** Live Search bills $0.025 per source, so a 25-source digest is
-about $0.63. Lower `VOS_PULSE_MAX_SOURCES` to spend less. The daily budget guard
-refuses a pulse once `VOS_DAILY_BUDGET_USD` is reached, and `/stats` shows the spend.
+**This costs money.** A digest measured at about $0.20 — cheaper than it used to be,
+but not free, and tokens now dominate because the search reasons between queries.
+xAI reports the exact amount it billed and that is what counts against
+`VOS_DAILY_BUDGET_USD`, so no estimate is involved. Lower `VOS_PULSE_MAX_TOOL_CALLS`
+to spend less. The budget guard refuses a pulse once the daily limit is reached,
+and `/stats` shows the spend.
 
 ### Shopping
 

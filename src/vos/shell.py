@@ -282,7 +282,7 @@ class VosBot:
         if self.budget and self.budget.exceeded():
             await message.answer(
                 f"💸 Daily budget reached (${self.budget.spent_today():.2f}). "
-                "No pulse — it would cost around $0.63."
+                "No pulse."
             )
             return
 
@@ -933,7 +933,7 @@ async def run() -> None:
             api_key=settings.xai_api_key.get_secret_value(),
             artifact_dir=settings.vos_artifact_dir,
             model=settings.vos_pulse_model,
-            max_sources=settings.vos_pulse_max_sources,
+            max_tool_calls=settings.vos_pulse_max_tool_calls,
             base_url=settings.vos_xai_base_url,
         )
 

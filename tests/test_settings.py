@@ -110,7 +110,7 @@ def test_pulse_defaults():
         VOS_ALLOWED_USER_ID=1,
         NEO4J_PASSWORD="p",
     )
-    assert settings.vos_pulse_max_sources == 25
+    assert settings.vos_pulse_max_tool_calls == 8
     assert settings.vos_pulse_topic == "AI"
 
 
@@ -158,15 +158,15 @@ def test_kiosk_pin_is_a_secret():
     assert settings.vos_kiosk_pin.get_secret_value() == "4321"
 
 
-def test_pulse_source_cap_is_configurable():
-    """The cap is the cost lever: 25 sources is ~$0.63 a digest at $0.025 each."""
+def test_pulse_tool_call_cap_is_configurable():
+    """The remaining cost lever: how many searches one digest may run."""
     settings = Settings(
         TELEGRAM_BOT_TOKEN="t",
         VOS_ALLOWED_USER_ID=1,
         NEO4J_PASSWORD="p",
-        VOS_PULSE_MAX_SOURCES=8,
+        VOS_PULSE_MAX_TOOL_CALLS=3,
     )
-    assert settings.vos_pulse_max_sources == 8
+    assert settings.vos_pulse_max_tool_calls == 3
 
 
 def test_the_shopping_db_has_a_working_default():
