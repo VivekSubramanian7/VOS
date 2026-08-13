@@ -43,6 +43,7 @@ split, not Telegram.
 | Overdue after downtime | Fire late, saying how late | Silently skipping is the one outcome that makes a reminder worse than a sticky note |
 | Due list | Disposable SQLite projection, beside `shopping.db` | Nodes for rows that flip between two states, exactly what ADR-012 declined for the shopping list |
 | Closing a reminder | Fourth `JournalEntry` kind, shaped like `ItemMark` | Projection-only means `--rebuild` resurrects every completed reminder — the failure ADR-013 exists for |
+| Recording a *fire* | Same journal kind, `action="fired"` | SQLite-only is the obvious answer and it is wrong: `--rebuild` wipes projections, so every past reminder would fire again. Nothing else can reconstruct it |
 | Timezone | `VOS_TIMEZONE`, `Europe/Berlin`; UTC everywhere internally | UTC-only makes "9am" drift an hour twice a year; zone-aware storage makes every comparison a timezone question |
 | Delivery, v1 | Telegram `sendMessage` to the owner | A kiosk banner is a second surface to get right before the first one is proven |
 
@@ -69,13 +70,25 @@ understands "every" without a scheduler that can expand it is worse than one tha
    ReminderTicker (asyncio, 30s)
         └─ due_at <= now() AND fired_at IS NULL
              └─ JobQueue.submit(f"remind:{id}")     ← same single worker (ADR-008)
-                  ├─ bot.send_message(owner, text)
-                  └─ store.mark_fired(id, now)      ← so a restart cannot re-fire
+                  ├─ bot.send_message(owner, text)  ← 1. send FIRST
+                  ├─ journal: ReminderMark(fired)   ← 2. then record it
+                  └─ store.mark_fired(id, now)      ← 3. projection follows
 
    /done <n> · /snooze <n> <when>
         └─ journal: ReminderMark                    ← user-authored (ADR-013)
              └─ store.close(id) / store.reschedule(id, due_at)
 ```
+
+### Send first, then record
+
+The order in step 1–2 is deliberate and is the opposite of the capture path's
+journal-then-ack. Recording a fire before sending would mean a crash in between leaves a
+reminder VOS believes it delivered and never did — silently, forever. That is the exact
+failure the feature exists to prevent. Sending first inverts the risk: a crash in the gap
+costs one duplicate message on the next tick, because the projection still shows it unfired.
+
+A duplicate reminder is an annoyance. A reminder you trusted and never received is the end of
+trusting the feature at all.
 
 The ticker holds no state. Everything it needs is a query against the projection, so a
 restart mid-flight loses nothing and re-derives its work — the same property that lets
@@ -90,9 +103,12 @@ unfired is fired immediately, with the message saying how overdue it is:
 
 This mirrors `requeue_unprocessed_videos` (`shell.py:557`): outstanding work derived from a
 projection rather than remembered in a queue. A reminder more than **7 days** overdue is
-closed unfired and reported in a single summary line — firing a fortnight-old reminder at
-boot is noise, not diligence, and that threshold is a flagged decision rather than a silent
-one.
+closed unfired and reported in a single summary line.
+
+That cutoff is a *policy*, not a safety net. Because the fire event is journalled, replay
+restores `fired_at` exactly and nothing can re-fire by accident — the cutoff exists only
+because a week-old reminder arriving at boot is noise rather than diligence. The threshold is
+a flagged decision rather than a silent one.
 
 ## Contracts (`src/vos/contracts.py`)
 
@@ -120,16 +136,22 @@ class ReminderView(BaseModel):
 
 
 class ReminderMark(BaseModel):
-    """Appended when a reminder is closed or moved.
+    """Appended when a reminder fires, or when the user closes or moves it.
 
-    Same argument as `ItemMark`: firing is something VOS did, but done-ness and a new
-    due time are decisions the person made, and without them in the journal a
-    `vos reclassify --rebuild` would resurrect every completed reminder.
+    `done`, `snoozed` and `cancelled` are decisions the person made — the `ItemMark`
+    argument, unchanged. `fired` is the odd one: VOS wrote it, not the user.
+
+    It belongs here anyway because it is **not derivable**. Nothing about a reminder's
+    text or due time tells you whether the message actually went out, so a projection
+    is the only other place it could live — and projections are wiped by
+    `vos reclassify --rebuild`, which would re-fire every past reminder. Contrast a
+    classification, which replay reconstructs exactly and which therefore stays out of
+    the journal. See ADR-017.
     """
     model_config = {"frozen": True}
     kind: Literal["reminder_mark"] = "reminder_mark"
     reminder: UUID
-    action: Literal["done", "snoozed", "cancelled"]
+    action: Literal["fired", "done", "snoozed", "cancelled"]
     due_at: datetime | None = None   # set only for `snoozed`
     at: datetime
 
@@ -151,14 +173,15 @@ An addition to the §7.3 table in `docs/architecture.md`:
 |---|---|---|---|
 | `reminders.db` | Derived projection — due list and fired/closed state | No | Yes, from journal |
 
-Every row rederives: the text and due time from the capture, the closures from
-`ReminderMark` replay. `rebuild()` in `projection.py:233` wipes and replays it exactly as it
-does `shopping.db`, and `replay_item_marks` (line 210) gains a sibling.
+Every row rederives, with no asterisk: the text and due time from the capture, and
+`fired_at`, `closed_at` and any snoozed due time from `ReminderMark` replay. `rebuild()` in
+`projection.py:233` wipes and replays it exactly as it does `shopping.db`, and
+`replay_item_marks` (line 210) gains a sibling, `replay_reminder_marks`.
 
-`fired_at` is the one column that is *not* rebuildable, and deliberately so: it records
-something VOS did, not something the user authored. After a `--rebuild` a past-due reminder
-that was already fired would fire once more. The mitigation is the 7-day cutoff above, and
-the spec states it rather than pretending otherwise.
+That completeness is the whole reason `fired` is a journal entry rather than a column that
+only ever lived in SQLite. The alternative — a projection holding the one fact replay cannot
+reconstruct — would mean a `--rebuild` silently re-firing every past-due reminder, and
+`--rebuild` is an ordinary operation here.
 
 ## Settings
 
@@ -188,9 +211,10 @@ reminder you stop trusting, and trust is the whole product.
 |---|---|
 | Unparseable time | Refused at `/remind` with examples; nothing stored |
 | Due time in the past | Accepted and fired on the next tick — the user may mean "now" |
-| `send_message` fails | Logged, `fired_at` left null, retried on the next tick |
+| `send_message` fails | Logged, no `fired` mark written, retried on the next tick |
 | Telegram down at boot | Recovery query re-runs every tick; nothing is lost |
-| Store write fails after send | Logged; worst case one duplicate message, never a missed one |
+| Crash between send and the `fired` mark | One duplicate on the next tick. Deliberate: the reverse order risks a reminder believed sent that never was |
+| Journal write fails after send | Same as above — logged, re-fires once. The journal is never left claiming a fire that did not happen |
 | Ticker task dies | Logged and restarted by the daemon; missed reminders fire late by design |
 | Reminder >7 days overdue at boot | Closed unfired, reported in one summary line |
 | Clock jumps (DST, NTP) | Comparison is UTC, so unaffected. Display shifts, which is correct |
@@ -201,8 +225,10 @@ retries or degrades to a late message.
 ## Testing
 
 - `tests/test_reminders.py` — store semantics on real SQLite in `tmp_path`, no mocks, and
-  the same replay-order property `test_shopping.py` asserts: closures are commutative, so
-  the journal replays in any order and converges.
+  the same replay-order property `test_shopping.py` asserts: marks are commutative, so the
+  journal replays in any order and converges. **The round trip is the headline test:** fire
+  a reminder, wipe the store, replay the journal, assert `fired_at` comes back identical and
+  the reminder does not fire a second time.
 - `tests/test_reminder_time.py` — the parser, table-driven over accepted and rejected
   strings, with DST boundaries pinned (the last Sunday in March and October) since that is
   the one date arithmetic that silently breaks.
@@ -231,11 +257,12 @@ Then, by hand:
 /reminders                                 → both listed, next first
 /done 1                                    → closes; journal gains a reminder_mark
 docker compose restart app                 → no duplicate fire of the one already fired
-vos reclassify --rebuild                   → open reminders survive, closed stay closed
+vos reclassify --rebuild                   → open reminders survive, closed stay closed,
+                                             and the already-fired one does NOT fire again
 ```
 
 The last two lines are the ones that matter. Everything else is a feature; those two are the
-invariants.
+invariants — and the second is only true because the fire is in the journal.
 
 ## Risks
 
@@ -243,8 +270,13 @@ invariants.
 will want to. ADR-017 scopes this to *the user's own reminder, at the user's own stated time,
 once* — and that sentence is the test any future proactive feature has to pass.
 
-**`fired_at` is not rebuildable.** Stated above rather than hidden; the 7-day cutoff bounds
-the blast radius to "one stale message after a rebuild".
+**A system-authored journal entry sets a precedent.** `fired` is the first thing VOS writes
+to the journal that the user did not author, and the next feature that wants to record
+something will cite it. The test it had to pass is narrow and should stay narrow: *not
+derivable by replay*. A classification fails that test and stays out; a fire passes it,
+because nothing in the reminder's text or due time reveals whether the message was sent. One
+line per fired reminder is negligible at this system's volume — the precedent is the cost,
+not the bytes.
 
 **The v2 classifier path can misfire.** A thought that merely mentions Tuesday is not a
 reminder. Mitigation: v2 ships only after v1 is trusted, extraction requires an explicit
