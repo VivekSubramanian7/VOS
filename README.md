@@ -127,3 +127,4 @@ in [DEPLOY.md](DEPLOY.md): `deploy/bootstrap-server.ps1` sets a machine up once,
 uv run pytest -m "not integration"   # offline, no Docker, no API spend
 uv run pytest                        # includes ephemeral-Neo4j integration tests
 ```
+....
