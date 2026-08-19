@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from vos.cassette import Cassette, CassetteEntry, price
 from vos.contracts import NAMESPACE_VOS
-from vos.pipeline import _usage
+from vos.pipeline import _usage, message_text
 
 log = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ class KitchenChat:
         self._sessions.put(session_id, messages)
 
         final = messages[-1]
-        content = str(getattr(final, "content", "")).strip()
+        content = message_text(final)
         if not content or getattr(final, "tool_calls", None):
             # The rounds cap ended the turn while the model still wanted tools.
             return _FALLBACK
@@ -280,7 +280,7 @@ def build_chat_graph(
                     thought_id=state.session_key,
                     model=model_name,
                     prompt=_last_human(state.messages),
-                    response={"content": str(getattr(response, "content", ""))},
+                    response={"content": message_text(response)},
                     input_tokens=tin,
                     output_tokens=tout,
                     cost_usd=price(model_name, tin, tout),
@@ -310,5 +310,5 @@ def build_chat_graph(
 def _last_human(messages: list[AnyMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
-            return str(message.content)
+            return message_text(message)
     return ""

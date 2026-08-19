@@ -118,6 +118,39 @@ def _usage(response: Any) -> tuple[int, int]:
     return 0, 0
 
 
+# VideoDistillation.summary is capped at 600 (contracts.py). Named here so the merge
+# below clamps to the same number the validator enforces.
+_SUMMARY_LIMIT = 600
+
+
+def message_text(response: Any) -> str:
+    """The text of a model reply, flattened across providers.
+
+    `.content` is a plain string on some providers and a list of typed blocks on
+    others - Gemini and thinking-enabled Claude both return
+    `[{"type": "text", ...}, {"type": "thinking", "signature": ...}]`. Calling
+    `str()` on that list yields its repr: hundreds of characters of Python syntax
+    with a base64 signature in the middle, which then fails a `max_length`
+    validator or, worse, is shown to a person.
+
+    Only `text` blocks are joined. Reasoning and signature blocks are deliberately
+    dropped: they are not the answer, and one of them leaking into a video summary
+    is what made this function necessary.
+    """
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "\n".join(piece for piece in parts if piece).strip()
+    return str(content).strip()
+
+
 def build_pipeline(
     model: BaseChatModel,
     *,
@@ -397,7 +430,11 @@ def build_video_pipeline(
                     HumanMessage(content="\n\n".join(summaries)),
                 ]
             )
-            return str(getattr(merged, "content", "")).strip() or summaries[0]
+            text = message_text(merged) or summaries[0]
+            # The per-chunk summaries came back through a validated schema, so they are
+            # already inside the limit; this merge is free text and is not. A summary
+            # clipped at the tail beats losing every note the video produced.
+            return text[:_SUMMARY_LIMIT].rstrip()
         except Exception:  # noqa: BLE001 - a weaker summary is fine; failing is not
             log.warning("Summary merge failed; using the first section summary")
             return summaries[0]

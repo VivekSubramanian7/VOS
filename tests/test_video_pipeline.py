@@ -359,3 +359,107 @@ async def test_video_run_is_recorded(tmp_path: Path):
     entry = cassette.latest(record.id)
     assert entry is not None
     assert entry.response["note_count"] == 1
+
+
+# --- content-block flattening -------------------------------------------- #
+
+
+class _Reply:
+    """Stands in for an AIMessage; only `.content` matters here."""
+
+    def __init__(self, content) -> None:
+        self.content = content
+
+
+def test_plain_string_content_is_returned_as_is():
+    from vos.pipeline import message_text
+
+    assert message_text(_Reply("  two sentences.  ")) == "two sentences."
+
+
+def test_content_blocks_are_flattened_to_their_text():
+    """Gemini and thinking-enabled Claude return a list of typed blocks, not a string."""
+    from vos.pipeline import message_text
+
+    reply = _Reply(
+        [
+            {"type": "text", "text": "The video argues X."},
+            {"type": "text", "text": "It then shows Y."},
+        ]
+    )
+    assert message_text(reply) == "The video argues X.\nIt then shows Y."
+
+
+def test_thinking_and_signature_blocks_are_dropped():
+    """The regression this function exists for: str() on the list yielded its repr —
+    hundreds of characters of Python syntax with a base64 signature inside — which blew
+    the 600-char summary validator and failed the whole video job."""
+    from vos.pipeline import message_text
+
+    reply = _Reply(
+        [
+            {"type": "thinking", "thinking": "hmm", "signature": "GA5ftmeNzssGTPrnA=="},
+            {"type": "text", "text": "A short summary."},
+        ]
+    )
+    out = message_text(reply)
+    assert out == "A short summary."
+    assert "signature" not in out
+    assert "GA5ftmeNzssGTPrnA==" not in out
+
+
+def test_bare_strings_inside_a_block_list_still_count():
+    from vos.pipeline import message_text
+
+    assert message_text(_Reply(["one", "two"])) == "one\ntwo"
+
+
+def test_missing_or_odd_content_never_raises():
+    from vos.pipeline import message_text
+
+    assert message_text(_Reply([])) == ""
+    assert message_text(object()) == ""
+    assert message_text(_Reply(None)) == "None"
+
+
+async def test_block_list_summary_does_not_fail_the_whole_video():
+    """The exact production failure: Gemini returned the merge summary as a list of
+    content blocks, str() gave its repr, and the 600-char validator rejected it — so a
+    video with perfectly good notes produced nothing at all, forever, on every restart.
+    """
+    model = StubModel(
+        [_distillation((f"claim {i}", i * 10)) for i in range(50)],
+        merge_text=[
+            {"type": "thinking", "thinking": "...", "signature": "GA5ftmeNzssGTPrnA=="},
+            {"type": "text", "text": "The video argues one-way light speed is unmeasurable."},
+        ],
+    )
+    graph = build_video_pipeline(
+        model, StubFetcher(_artifact(segment_count=2000)), model_name="stub", max_chunks=2
+    )
+
+    out = await graph.ainvoke(VideoState(video_id=VID))
+
+    assert out["error"] is None
+    assert out["distillation"] is not None
+    assert out["distillation"].summary == (
+        "The video argues one-way light speed is unmeasurable."
+    )
+    assert out["distillation"].notes
+
+
+async def test_an_overlong_merged_summary_is_clipped_not_fatal():
+    """Free text from the merge call is not schema-validated, so a chatty model could
+    otherwise blow the same validator the block list did."""
+    model = StubModel(
+        [_distillation((f"claim {i}", i * 10)) for i in range(50)],
+        merge_text="x" * 2000,
+    )
+    graph = build_video_pipeline(
+        model, StubFetcher(_artifact(segment_count=2000)), model_name="stub", max_chunks=2
+    )
+
+    out = await graph.ainvoke(VideoState(video_id=VID))
+
+    assert out["error"] is None
+    assert len(out["distillation"].summary) <= 600
