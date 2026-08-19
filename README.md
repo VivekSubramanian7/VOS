@@ -42,6 +42,7 @@ uv run vos-bot                # long-polling; no public URL needed
 | `/video <url>` · `/notes <term>` · `/redistil <url>` | Process now · search video notes · re-run from cache |
 | `/shopping` · `/bought <name\|number>` | The shopping list, with a tap-to-buy button per item |
 | `/doctor` | Open appointment slots at your practice on Doctolib |
+| `/write <keywords>` | A LinkedIn post from X plus your own notes |
 
 ### X pulse
 
@@ -58,6 +59,20 @@ xAI reports the exact amount it billed and that is what counts against
 `VOS_DAILY_BUDGET_USD`, so no estimate is involved. Lower `VOS_PULSE_MAX_TOOL_CALLS`
 to spend less. The budget guard refuses a pulse once the daily limit is reached,
 and `/stats` shows the spend.
+
+### LinkedIn writer
+
+`/write ai agents, evals` searches X for what is being argued this week and your own
+captured thoughts for what you already think, then writes one post and hands it to you
+to copy. It never posts anything.
+
+The reason it is not just a chatbot tab: the draft is built on **your** notes, and the
+reply tells you which one, so you can check it. When nothing of yours matches the
+keywords it says so rather than inventing an anecdote — a fabricated story published
+under your own name is not a style problem.
+
+About $0.22 a draft, mostly the X search. Full design:
+[docs/pipelines/linkedin-writer.md](docs/pipelines/linkedin-writer.md).
 
 ### Doctor appointments
 

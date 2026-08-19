@@ -19,7 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from vos.contracts import (
@@ -30,6 +30,8 @@ from vos.contracts import (
     ShoppingResult,
     ShoppingStore,
     VideoResult,
+    WriteResult,
+    draft_id,
     pulse_id,
 )
 from vos.graph import Neo4jGraph
@@ -176,6 +178,81 @@ async def run_pulse(
         post_count=count,
         dropped=dropped,
         cost_usd=artifact.cost_usd,
+    )
+
+
+async def run_write(
+    write_pipeline, graph, keywords: list[str], digest, *, artifact_dir=None,
+    model_name: str = "unknown", cost_usd: float | None = None, cassette=None,
+) -> WriteResult:
+    """Compose one LinkedIn draft and cache it.
+
+    Mirrors `run_pulse`: the pipeline produces data, this writes it, and a failure is
+    reported rather than raised. The X search that produced `digest` has already been
+    paid for by the time this runs, so a compose failure must not also cost the digest.
+    """
+    from vos.cassette import CassetteEntry
+    from vos.pipeline import WriteState
+    from vos.writer import DraftStore, build_artifact, gather_own_material, trend_lines
+
+    own_notes, thought_ids = await gather_own_material(graph, keywords)
+    summary, posts = trend_lines(digest)
+
+    out = await write_pipeline.ainvoke(
+        WriteState(
+            keywords=keywords,
+            trend_summary=summary,
+            trend_posts=posts,
+            own_notes=own_notes,
+        )
+    )
+    draft = out.get("draft")
+    error = out.get("error")
+    if error or draft is None:
+        return WriteResult(keywords=keywords, error=error or "no draft produced")
+
+    written_at = datetime.now(UTC)
+
+    if cassette:
+        with contextlib.suppress(Exception):
+            cassette.record(
+                CassetteEntry(
+                    thought_id=draft_id(keywords, written_at),
+                    model=f"{model_name} (write)",
+                    prompt=", ".join(keywords),
+                    response={"hook": draft.hook, "chars": len(draft.text)},
+                    latency_ms=int(out.get("latency_ms") or 0),
+                )
+            )
+
+    if artifact_dir is not None:
+        source_urls = [
+            u for u in (getattr(p, "url", None) for p in (getattr(digest, "posts", None) or []))
+            if u
+        ]
+        # Logged rather than suppressed: a silent failure here loses a draft that
+        # cost real money, and the only way anyone would notice is an empty folder.
+        try:
+            DraftStore(artifact_dir).write(
+                build_artifact(
+                    draft,
+                    keywords=keywords,
+                    model=model_name,
+                    source_posts=source_urls,
+                    source_thoughts=thought_ids,
+                    cost_usd=cost_usd,
+                    now=written_at,
+                )
+            )
+        except Exception:  # noqa: BLE001 - the user still gets the post in the reply
+            log.warning("Could not cache draft for %s", keywords, exc_info=True)
+
+    return WriteResult(
+        keywords=keywords,
+        draft=draft,
+        source_posts=len(posts),
+        source_thoughts=len(own_notes),
+        cost_usd=cost_usd,
     )
 
 

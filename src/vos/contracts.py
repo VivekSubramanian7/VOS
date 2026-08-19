@@ -615,6 +615,102 @@ class PulseError(Exception):
 
 
 # --------------------------------------------------------------------------- #
+# LinkedIn writer -- keywords in, one post out
+# --------------------------------------------------------------------------- #
+
+NAMESPACE_DRAFT = UUID("2c7e59b1-0a46-4d38-9f52-8e3b1d70c4a9")
+
+
+def draft_id(keywords: list[str], written_at: datetime) -> UUID:
+    """One draft. Keyed on the keywords plus the moment, because asking again an hour
+    later is a different draft off different trends, not a repeat of this one."""
+    key = ",".join(k.strip().casefold() for k in keywords)
+    return uuid5(NAMESPACE_DRAFT, f"{key}:{written_at.isoformat()}")
+
+
+class LinkedInDraft(BaseModel):
+    """A post ready to paste. These field descriptions are part of the prompt."""
+
+    hook: str = Field(
+        max_length=210,
+        description=(
+            "The opening line. It must stand alone: LinkedIn truncates at about 140 "
+            "characters on mobile and this is all most people will ever read."
+        ),
+    )
+    body: str = Field(
+        description=(
+            "The rest of the post, after the hook. Short paragraphs separated by blank "
+            "lines. Two concrete insights, then one closing line."
+        ),
+    )
+    hashtags: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="Three to five, lowercase, no # prefix",
+    )
+    grounded_in: str | None = Field(
+        default=None,
+        description=(
+            "The specific from the author's own notes that this post is built on, quoted "
+            "or closely paraphrased. Null when their notes held nothing relevant -- in "
+            "which case invent nothing and write from the trend alone."
+        ),
+    )
+
+    @property
+    def text(self) -> str:
+        """The post as it goes into LinkedIn's box."""
+        tags = " ".join(f"#{t.lstrip('#')}" for t in self.hashtags)
+        parts = [self.hook, self.body.strip()]
+        if tags:
+            parts.append(tags)
+        return "\n\n".join(p for p in parts if p)
+
+
+class DraftArtifact(BaseModel):
+    """A generated draft, cached on disk.
+
+    Generated rather than fetched, but the same call as `PulseArtifact` (ADR-010): it
+    cost real money, it cannot be re-derived identically, and it is not something the
+    user authored -- so it is an artifact and never a journal entry.
+    """
+
+    draft: LinkedInDraft
+    keywords: list[str]
+    written_at: datetime
+    model: str
+    source_posts: list[str] = Field(default_factory=list)
+    """URLs of the X posts the draft drew on. Recorded so a claim can be traced back."""
+    source_thoughts: list[UUID] = Field(default_factory=list)
+    """The author's own thoughts that supplied the personal angle."""
+    cost_usd: float | None = None
+
+
+class WriteResult(BaseModel):
+    """Outcome of one /write -- what the user is told."""
+
+    keywords: list[str] = Field(default_factory=list)
+    draft: LinkedInDraft | None = None
+    source_posts: int = 0
+    source_thoughts: int = 0
+    cost_usd: float | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.draft is not None
+
+
+class WriteError(Exception):
+    """Raised when a draft cannot be produced. Carries a message fit to show the user."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+# --------------------------------------------------------------------------- #
 # Doctolib — open appointment slots at one practice
 # --------------------------------------------------------------------------- #
 

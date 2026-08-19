@@ -46,6 +46,8 @@ from vos.contracts import (
     ItemView,
     SourceKind,
     SourceRef,
+    WriteError,
+    WriteResult,
     canonical,
 )
 from vos.graph import Neo4jGraph
@@ -57,6 +59,7 @@ from vos.projection import (
     process_video,
     reproject_missing,
     run_pulse,
+    run_write,
 )
 from vos.pulse import normalise_handle
 from vos.render import (
@@ -65,6 +68,7 @@ from vos.render import (
     render_all_posts,
     render_capture,
     render_doctor,
+    render_draft,
     render_following,
     render_pulse,
     render_search,
@@ -76,6 +80,7 @@ from vos.render import (
     split_message,
 )
 from vos.video import VideoFetcher, extract_video_id, find_video_id
+from vos.writer import parse_keywords
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +130,9 @@ class VosBot:
         shopping: Any = None,
         shopping_pipeline: Any = None,
         slot_fetcher: Any = None,
+        write_pipeline: Any = None,
+        artifact_dir: Any = None,
+        model_name: str = "unknown",
     ) -> None:
         self.journal = journal
         self.graph = graph
@@ -138,6 +146,9 @@ class VosBot:
         self.shopping = shopping
         self.shopping_pipeline = shopping_pipeline
         self.slot_fetcher = slot_fetcher
+        self.write_pipeline = write_pipeline
+        self.artifact_dir = artifact_dir
+        self.model_name = model_name
 
     # -- capture -------------------------------------------------------- #
 
@@ -308,6 +319,78 @@ class VosBot:
             await _replace(note, message.answer, render_pulse(result))
 
         await self.jobs.submit(f"pulse:{topic}", job)
+
+    # -- write ---------------------------------------------------------- #
+
+    async def cmd_write(self, message: Message, command: CommandObject) -> None:
+        """Keywords in, one LinkedIn post out.
+
+        Costs an X search plus a compose call, so the budget is checked before
+        queueing for the same reason /pulse checks it: refusing early is the whole
+        point of the guard. Queued because the search is slow and the polling loop
+        must not stall behind it.
+        """
+        if self.pulse_fetcher is None or self.write_pipeline is None:
+            await message.answer(
+                "✍️ Writing isn't enabled. It needs "
+                "<code>XAI_API_KEY</code> in your .env for the X search."
+            )
+            return
+        if self.jobs is None:
+            await message.answer("Background jobs aren't enabled.")
+            return
+        if self.budget and self.budget.exceeded():
+            await message.answer(
+                f"💸 Daily budget reached (${self.budget.spent_today():.2f}). No draft."
+            )
+            return
+
+        try:
+            keywords = parse_keywords(command.args or "")
+        except WriteError as exc:
+            await message.answer(escape(exc.reason))
+            return
+
+        async def job() -> None:
+            shown = escape(", ".join(keywords))
+            note = await message.answer(f"✍️ Reading X on <i>{shown}</i>…")
+            try:
+                pulse = await run_pulse(
+                    self.pulse_fetcher,
+                    self.graph,
+                    " ".join(keywords),
+                    cassette=self.cassette,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Write search failed for %s", keywords)
+                await note.edit_text(
+                    render_draft(
+                        WriteResult(keywords=keywords, error=type(exc).__name__)
+                    )
+                )
+                return
+
+            # A thin or failed digest is not fatal: the draft can still be written
+            # from the author own notes, which is where the substance lives anyway.
+            digest = pulse.digest if pulse.ok else None
+            await note.edit_text("✍️ Writing…")
+            try:
+                result = await run_write(
+                    self.write_pipeline,
+                    self.graph,
+                    keywords,
+                    digest,
+                    artifact_dir=self.artifact_dir,
+                    model_name=self.model_name,
+                    cost_usd=pulse.cost_usd,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Write compose failed for %s", keywords)
+                result = WriteResult(keywords=keywords, error=type(exc).__name__)
+
+            await _replace(note, message.answer, render_draft(result))
+
+        await self.jobs.submit(f"write:{','.join(keywords)}", job)
 
     # -- doctor --------------------------------------------------------- #
 
@@ -755,6 +838,7 @@ class VosBot:
         r.message.register(self.cmd_redistil, Command("redistil"))
         r.message.register(self.cmd_pulse, Command("pulse"))
         r.message.register(self.cmd_doctor, Command("doctor"))
+        r.message.register(self.cmd_write, Command("write"))
         r.message.register(self.cmd_notes, Command("notes"))
         r.message.register(self.cmd_more, Command("more"))
         r.message.register(self.cmd_shopping, Command("shopping"))
@@ -930,6 +1014,7 @@ async def run() -> None:
         build_pipeline,
         build_shopping_pipeline,
         build_video_pipeline,
+        build_write_pipeline,
         load_model,
     )
     from vos.projection import replay_item_marks
@@ -983,6 +1068,11 @@ async def run() -> None:
             base_url=settings.vos_xai_base_url,
         )
 
+    # The compose half runs on the main model; the X half is the pulse fetcher.
+    write_pipeline = build_write_pipeline(
+        model, model_name=settings.vos_model, cassette=cassette
+    )
+
     slot_fetcher = None
     if settings.vos_doctolib_url:
         from vos.doctolib import SlotFetcher
@@ -1009,6 +1099,9 @@ async def run() -> None:
         shopping=shopping,
         shopping_pipeline=shopping_pipeline,
         slot_fetcher=slot_fetcher,
+        write_pipeline=write_pipeline,
+        artifact_dir=settings.vos_artifact_dir,
+        model_name=settings.vos_model,
     )
 
     async def announce(text: str, **kwargs: Any):

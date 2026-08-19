@@ -28,6 +28,7 @@ from vos.contracts import (
     ThoughtView,
     VideoNote,
     VideoResult,
+    WriteResult,
 )
 
 CATEGORY_LABELS: dict[str, str] = {
@@ -435,6 +436,46 @@ def render_doctor(result: DoctolibResult) -> str:
     return "\n".join(lines)
 
 
+def render_draft(result: WriteResult) -> str:
+    """A finished LinkedIn post, ready to copy.
+
+    The post itself goes in a <pre> block so Telegram offers a tap-to-copy and does not
+    reflow the blank lines the post depends on -- a LinkedIn post pasted without its
+    paragraph breaks is a wall of text.
+    """
+    if not result.ok:
+        return f"✍️ Couldn't write it: <i>{escape(result.error or 'unknown reason')}</i>."
+
+    draft = result.draft
+    assert draft is not None  # guaranteed by result.ok
+
+    text = draft.text
+    lines = [
+        f"✍️ <b>{escape(', '.join(result.keywords))}</b>",
+        "",
+        f"<pre>{escape(text)}</pre>",
+        "",
+        f"<i>{len(text)} characters</i>",
+    ]
+
+    # Saying what it was built on is what makes the grounding checkable rather than
+    # claimed. A draft with no personal source is a different thing to read.
+    if draft.grounded_in:
+        lines.append(f"🧵 <i>Grounded in: {escape(draft.grounded_in)}</i>")
+    else:
+        lines.append(
+            "⚠️ <i>Nothing of yours matched these keywords, so this is written "
+            "from the trend alone. Worth adding your own angle before posting.</i>"
+        )
+    lines.append(
+        f"<i>Sources: {result.source_posts} post(s) on X, "
+        f"{result.source_thoughts} of your own note(s)</i>"
+    )
+    if result.cost_usd is not None:
+        lines.append(f"💸 ${_cents(result.cost_usd)}")
+    return "\n".join(lines)
+
+
 def render_all_posts(posts: list[PostView]) -> str:
     """Every stored post from one digest — the `/more` reply."""
     if not posts:
@@ -584,6 +625,10 @@ Send a YouTube link and I'll distil it automatically.
 Say what you need and I'll add it: “out of coffee, and 2L oat milk”.
 /shopping — the list, with a button per item to tick off
 /bought &lt;name|number&gt; — tick something off by typing
+
+<b>Writing</b>
+/write &lt;keyword&gt;, &lt;keyword&gt; - a LinkedIn post from what X is saying
+and what you have already thought about it
 
 <b>Appointments</b>
 /doctor — open slots at your practice on Doctolib

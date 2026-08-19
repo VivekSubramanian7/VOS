@@ -29,6 +29,7 @@ from vos.cassette import Cassette, CassetteEntry, price
 from vos.contracts import (
     CaptureRecord,
     Classification,
+    LinkedInDraft,
     ShoppingExtraction,
     SourceRef,
     VideoArtifact,
@@ -577,6 +578,145 @@ def build_shopping_pipeline(
     builder.add_node("extract", extract)
     builder.set_entry_point("extract")
     builder.add_edge("extract", END)
+    return builder.compile()
+
+
+# --------------------------------------------------------------------------- #
+# LinkedIn writer
+# --------------------------------------------------------------------------- #
+
+# Every number in this prompt is measured rather than felt, which is why they are
+# numbers: the mobile "see more" cut lands near 140 characters, engagement peaks
+# between roughly 1,300 and 2,100 characters, and posts under 400 underperform badly.
+#
+# The banned-words list is not style policing. Those words are the statistical
+# fingerprint of generated text, and one of them in the first line costs the reader's
+# trust before the argument starts.
+#
+# The rule that actually does the work is GROUNDING. A post assembled purely from
+# trending content reads as competent and forgettable no matter how good the prose,
+# because it contains nothing only this author could say. Hence `grounded_in`, and
+# hence the prohibition on inventing one when the notes are empty: a fabricated
+# anecdote on LinkedIn is a lie told under the author's own name.
+WRITE_PROMPT = """You write LinkedIn posts for one person, in their voice, from their own notes.
+
+You are given: keywords, what is being said on X about them right now, and the notes
+this person has captured themselves.
+
+Write ONE post.
+
+Structure:
+1. A hook that stands alone. It is truncated near 140 characters on mobile, so the
+   first sentence must earn the tap by itself. Never open with a rhetorical question.
+2. Two concrete insights. Specific over general every time: a number, a name, a thing
+   that happened, a decision and its consequence.
+3. One closing line. An invitation to reply beats "thoughts?" and beats a hashtag wall.
+4. Three to five hashtags, lowercase, returned separately.
+
+Length: aim for 1,300-2,100 characters in hook + body. Short paragraphs, blank line
+between each, because this is read on a phone. Plain words, the level a smart
+fifteen-year-old reads comfortably.
+
+Voice:
+- Vary sentence length on purpose. Some long. Some four words. Fragments are fine.
+  Uniform rhythm is the single loudest sign that a machine wrote something.
+- Contractions on. Write how a person talks.
+- Never use: delve, crucial, robust, comprehensive, nuanced, leverage, unlock,
+  landscape, testament, tapestry, "in today's fast-paced world", "game-changer".
+- No em dashes. No "Here's the thing:". No listicle unless it is genuinely a list.
+- No emoji except at most one, and only if it carries meaning.
+
+Grounding, and this one is absolute:
+- Build the post on something from THEIR OWN NOTES. Put that thing in `grounded_in`.
+- The X material is for timing and evidence: what is being argued this week, who is
+  arguing it. It is not the substance.
+- If their notes contain nothing relevant, set `grounded_in` to null and write from
+  the trend alone, in their voice.
+- NEVER invent an anecdote, a client, a metric, a job, or a memory. Not a small one,
+  not a plausible one. If you did not read it in their notes, they did not say it, and
+  publishing it under their name would be a lie.
+"""
+
+
+class WriteState(BaseModel):
+    """State for the writing pipeline.
+
+    A separate graph again: this runs on a worker after an X search has already been
+    paid for, and re-entering any other graph would re-run work that cost money.
+    """
+
+    keywords: list[str] = Field(default_factory=list)
+    trend_summary: str = ""
+    trend_posts: list[str] = Field(default_factory=list)
+    own_notes: list[str] = Field(default_factory=list)
+    draft: LinkedInDraft | None = None
+    error: str | None = None
+    latency_ms: int = 0
+
+
+def _write_input(state: WriteState) -> str:
+    """The human turn: keywords, the trend, and the author's own material."""
+    lines = ["KEYWORDS: " + ", ".join(state.keywords), ""]
+    if state.trend_summary:
+        lines += ["WHAT X IS SAYING RIGHT NOW:", state.trend_summary, ""]
+    if state.trend_posts:
+        lines.append("RECENT POSTS:")
+        lines += [f"- {p}" for p in state.trend_posts]
+        lines.append("")
+    if state.own_notes:
+        lines.append("THEIR OWN NOTES (this is where the post must be grounded):")
+        lines += [f"- {n}" for n in state.own_notes]
+    else:
+        lines.append(
+            "THEIR OWN NOTES: none on this topic. Set grounded_in to null and invent "
+            "nothing."
+        )
+    return "\n".join(lines)
+
+
+def build_write_pipeline(
+    model: BaseChatModel,
+    *,
+    model_name: str = "unknown",
+    cassette: Cassette | None = None,
+):
+    """One node: sources in, a draft out.
+
+    Errors are returned, never raised, for the same reason the shopping node returns
+    them: the X search that fed this has already been paid for, and losing the draft
+    should not also lose the digest it was built from.
+    """
+    structured = model.with_structured_output(LinkedInDraft)
+
+    async def compose(state: WriteState) -> dict:
+        started = time.perf_counter()
+        try:
+            draft = await structured.ainvoke(
+                [
+                    SystemMessage(content=WRITE_PROMPT),
+                    HumanMessage(content=_write_input(state)),
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001 - provider errors are not our crash
+            log.exception("Write compose failed for %s", state.keywords)
+            return {"draft": None, "error": f"{type(exc).__name__}"}
+
+        if not isinstance(draft, LinkedInDraft):
+            return {"draft": None, "error": "the model returned nothing usable"}
+
+        # Recorded by `run_write`, not here: a draft has no originating thought, so
+        # the cassette key is the draft's own id, which only exists once the
+        # artifact is stamped. Same split as /pulse, which records in projection.py.
+        return {
+            "draft": draft,
+            "error": None,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+    builder = StateGraph(WriteState)
+    builder.add_node("compose", compose)
+    builder.set_entry_point("compose")
+    builder.add_edge("compose", END)
     return builder.compile()
 
 
